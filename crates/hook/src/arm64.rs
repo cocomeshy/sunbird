@@ -486,3 +486,50 @@ pub fn sret_callee(detour: usize) -> Vec<u8> {
    code.extend(absolute_jump(detour));
    code
 }
+
+/// The registers [`observe_stub`] saves on the stack, in order: `x0`..`x8`,
+/// `x30`, then `d0`..`d7`.
+pub const OBSERVED_WORDS: usize = 18;
+
+/// Code that saves the argument registers, calls `on_hit(&saved, id)` and
+/// continues at the address it returns, with every argument register as it
+/// came in.
+#[must_use]
+pub fn observe_stub(id: u16, on_hit: usize) -> Vec<u8> {
+   const FRAME: u32 = 0xA0;
+   let pair = |base: u32, first: u32, second: u32, at: u32| {
+      base | ((at / 8) & 0x7F) << 15 | second << 10 | 31 << 5 | first
+   };
+   let saves = |base: u32, fp: u32| {
+      let gprs = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 30)];
+      let fprs = [(0, 1), (2, 3), (4, 5), (6, 7)];
+      gprs
+         .iter()
+         .zip((0..).step_by(16))
+         .map(move |(&(first, second), at)| pair(base, first, second, at))
+         .chain(
+            fprs
+               .iter()
+               .zip((80..).step_by(16))
+               .map(move |(&(first, second), at)| pair(fp, first, second, at)),
+         )
+         .collect::<Vec<u32>>()
+   };
+   let mut words = vec![0xD100_03FF | FRAME << 10];
+   words.extend(saves(0xA900_0000, 0x6D00_0000));
+   // `mov x0, sp; movz x1, #id; ldr x16, on_hit; blr x16; mov x16, x0`.
+   words.extend([0x9100_03E0, 0xD280_0001 | u32::from(id) << 5]);
+   let literal_at = words.len() + 9 + 2 + 3;
+   let ldr_at = words.len();
+   words.push(0x5800_0010 | (u32::try_from(literal_at - ldr_at).unwrap_or(0) << 5));
+   words.extend([0xD63F_0200, 0xAA00_03F0]);
+   words.extend(saves(0xA940_0000, 0x6D40_0000));
+   words.extend([0x9100_03FF | FRAME << 10, 0xD61F_0200]);
+   debug_assert_eq!(words.len(), literal_at);
+   let mut code = words
+      .iter()
+      .flat_map(|word| word.to_le_bytes())
+      .collect::<Vec<u8>>();
+   code.extend(on_hit.to_le_bytes());
+   code
+}

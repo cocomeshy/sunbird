@@ -285,9 +285,10 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
    Ok(native)
 }
 
-/// `phoenix.native.hook`, on `phoenix_hook::x86::observe`, which saves the
-/// argument registers.
-#[cfg(any(windows, target_os = "linux"))]
+/// `phoenix.native.hook`, on `phoenix_hook::x86::observe` on Windows and
+/// Linux, which saves the argument registers, and on
+/// [`phoenix_hook::arm64::observe_stub`] on macOS.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod observe {
    use std::{
       cell::Cell,
@@ -306,12 +307,21 @@ mod observe {
       },
    };
 
+   use phoenix_hook::image::Image;
+   #[cfg(any(windows, target_os = "linux"))]
+   use phoenix_hook::x86::{
+      Observed,
+      Regs,
+   };
+   #[cfg(target_os = "macos")]
    use phoenix_hook::{
-      image::Image,
-      x86::{
-         Observed,
-         Regs,
+      arm64::{
+         JUMP_LEN,
+         OBSERVED_WORDS,
+         observe_stub,
       },
+      image::jit_copy,
+      pattern::Pattern,
    };
    use serde::Serialize;
 
@@ -345,7 +355,18 @@ mod observe {
       /// The first bytes behind each argument that points at readable memory.
       peek:   [Option<String>; 4],
       caller: String,
-      thread: u32,
+      #[serde(flatten)]
+      origin: Origin,
+   }
+
+   #[derive(Serialize)]
+   #[serde(rename_all = "lowercase")]
+   enum Origin {
+      #[cfg(any(windows, target_os = "linux"))]
+      Thread(u32),
+      /// Return addresses inside Discord up the frame-pointer chain.
+      #[cfg(target_os = "macos")]
+      Stack(Vec<String>),
    }
 
    #[derive(Serialize)]
@@ -368,19 +389,29 @@ mod observe {
          limit: AtomicU64::new(0),
       }
    }; MAX_HOOKS];
-   static OBSERVED: Mutex<[Option<Observed>; MAX_HOOKS]> = Mutex::new([const { None }; MAX_HOOKS]);
+   /// Where each observed call continues, set once the jump is written.
+   #[cfg(target_os = "macos")]
+   static TRAMPOLINES: [AtomicUsize; MAX_HOOKS] = [const { AtomicUsize::new(0) }; MAX_HOOKS];
+
+   /// What undoes each hook: the stub on x86, the bytes it overwrote on
+   /// macOS.
+   #[cfg(any(windows, target_os = "linux"))]
+   type Undo = Observed;
+   #[cfg(target_os = "macos")]
+   type Undo = [u8; JUMP_LEN];
+
+   static HOOKS: Mutex<[Option<Undo>; MAX_HOOKS]> = Mutex::new([const { None }; MAX_HOOKS]);
 
    /// Observes the function at `addr`, logging its first `limit` calls.
    /// Returns the hook's id.
    pub fn hook(image: &Image<'static>, addr: usize, limit: u64) -> Result<usize, String> {
-      let mut observed = OBSERVED.lock().unwrap_or_else(PoisonError::into_inner);
-      if let Some(id) = observed
-         .iter()
-         .position(|hook| hook.as_ref().is_some_and(|hook| hook.addr() == addr))
+      let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+      if let Some(id) = (0..MAX_HOOKS)
+         .find(|&id| hooks[id].is_some() && SLOTS[id].addr.load(Ordering::Relaxed) == addr)
       {
          return Err(format!("{} is hooked already as {id}", place(addr)));
       }
-      let id = observed
+      let id = hooks
          .iter()
          .position(Option::is_none)
          .ok_or_else(|| format!("{MAX_HOOKS} hooks at most, unhook one first"))?;
@@ -388,66 +419,121 @@ mod observe {
       slot.addr.store(addr, Ordering::Relaxed);
       slot.hits.store(0, Ordering::Relaxed);
       slot.limit.store(limit, Ordering::Relaxed);
-      // SAFETY: the debug console's user picks a function start. A wrong pick
-      // or a thread paused in its first 14 bytes can crash Discord, which a
-      // reversing tool accepts.
-      let hook = unsafe { phoenix_hook::x86::observe(image, addr, on_hit, id) }
-         .map_err(|err| err.to_string())?;
-      observed[id] = Some(hook);
-      drop(observed);
+      hooks[id] = Some(attach(image, addr, id)?);
+      drop(hooks);
       log::info!("native: hooked {} as {id}", place(addr));
       Ok(id)
    }
 
+   #[cfg(any(windows, target_os = "linux"))]
+   fn attach(image: &Image<'static>, addr: usize, id: usize) -> Result<Undo, String> {
+      // SAFETY: the debug console's user picks a function start. A wrong pick
+      // or a thread paused in its first 14 bytes can crash Discord, which a
+      // reversing tool accepts.
+      unsafe { phoenix_hook::x86::observe(image, addr, on_hit, id) }.map_err(|err| err.to_string())
+   }
+
+   #[cfg(target_os = "macos")]
+   fn attach(image: &Image<'static>, addr: usize, id: usize) -> Result<Undo, String> {
+      let original: [u8; JUMP_LEN] = image
+         .read(addr, JUMP_LEN)
+         .and_then(|bytes| bytes.try_into().ok())
+         .ok_or("the function is unmapped")?;
+      TRAMPOLINES[id].store(0, Ordering::Release);
+      let stub = u16::try_from(id)
+         .ok()
+         .and_then(|id| jit_copy(&observe_stub(id, on_hit as *const () as usize)))
+         .ok_or("no memory for the stub")?;
+      // SAFETY: the debug console's user picks a function start. A thread
+      // inside its first 16 bytes can crash Discord, which a reversing tool
+      // accepts.
+      let trampoline = unsafe { image.hook_entry(addr, Pattern::new("00"), 0, stub) }
+         .map_err(|err| err.to_string())?;
+      TRAMPOLINES[id].store(trampoline, Ordering::Release);
+      Ok(original)
+   }
+
    pub fn unhook(image: &Image<'static>, id: usize) -> Result<bool, String> {
-      let mut observed = OBSERVED.lock().unwrap_or_else(PoisonError::into_inner);
-      let Some(hook) = observed.get_mut(id).and_then(Option::take) else {
+      let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+      let Some(undo) = hooks.get_mut(id).and_then(Option::take) else {
          return Ok(false);
       };
-      drop(observed);
+      drop(hooks);
       SLOTS[id].limit.store(0, Ordering::Relaxed);
-      // SAFETY: as for `hook`.
-      unsafe { hook.remove(image) }.map_err(|err| err.to_string())?;
+      // SAFETY: as for `attach`.
+      #[cfg(any(windows, target_os = "linux"))]
+      let undone = unsafe { undo.remove(image) };
+      // SAFETY: puts back the bytes `attach` replaced. The stub and trampoline
+      // stay mapped for calls already inside them.
+      #[cfg(target_os = "macos")]
+      let undone = unsafe { image.write_code(SLOTS[id].addr.load(Ordering::Relaxed), &undo) };
+      undone.map_err(|err| err.to_string())?;
       Ok(true)
    }
 
    pub fn list() -> Vec<Listed> {
-      let observed = OBSERVED.lock().unwrap_or_else(PoisonError::into_inner);
-      observed
-         .iter()
-         .enumerate()
-         .filter_map(|(id, hook)| {
-            let hook = hook.as_ref()?;
-            Some(Listed {
+      let hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+      (0..MAX_HOOKS)
+         .filter(|&id| hooks[id].is_some())
+         .map(|id| {
+            Listed {
                id,
-               at: place(hook.addr()),
+               at: place(SLOTS[id].addr.load(Ordering::Relaxed)),
                hits: SLOTS[id].hits.load(Ordering::Relaxed),
-            })
+            }
          })
          .collect()
    }
 
-   extern "C" fn on_hit(id: usize, regs: &Regs) {
+   /// Runs `record` unless this thread is recording already, since recording
+   /// allocates and locks, which can reach the hooked function again.
+   fn guarded(record: impl FnOnce()) {
       thread_local! {
          static BUSY: Cell<bool> = const { Cell::new(false) };
       }
-      // Recording allocates and locks, which can reach the hooked function
-      // again.
       if BUSY.try_with(|busy| busy.replace(true)).unwrap_or(true) {
          return;
       }
-      let _ = panic::catch_unwind(AssertUnwindSafe(|| record(id, regs)));
+      let _ = panic::catch_unwind(AssertUnwindSafe(record));
       let _ = BUSY.try_with(|busy| busy.set(false));
    }
 
-   fn record(id: usize, regs: &Regs) {
+   #[cfg(any(windows, target_os = "linux"))]
+   extern "C" fn on_hit(id: usize, regs: &Regs) {
+      guarded(|| record(id, regs.args(), regs.ret));
+   }
+
+   /// Records the call and returns where it continues.
+   #[cfg(target_os = "macos")]
+   extern "C" fn on_hit(regs: &[u64; OBSERVED_WORDS], id: usize) -> usize {
+      guarded(|| {
+         // Each caller once, so a hot function still shows the rare caller.
+         static SEEN: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+         let caller = regs[9];
+         let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+         if seen.contains(&(id, caller)) {
+            return;
+         }
+         seen.push((id, caller));
+         drop(seen);
+         record(id, [regs[0], regs[1], regs[2], regs[3]], caller);
+      });
+      loop {
+         let trampoline = TRAMPOLINES[id].load(Ordering::Acquire);
+         if trampoline != 0 {
+            return trampoline;
+         }
+         std::hint::spin_loop();
+      }
+   }
+
+   fn record(id: usize, args: [u64; 4], caller: u64) {
       let Some(slot) = SLOTS.get(id) else {
          return;
       };
       if slot.hits.fetch_add(1, Ordering::Relaxed) >= slot.limit.load(Ordering::Relaxed) {
          return;
       }
-      let args = regs.args();
       let peek = |value: u64| {
          usize::try_from(value)
             .ok()
@@ -455,19 +541,51 @@ mod observe {
             .and_then(|addr| Os::read_memory(addr, PEEK))
             .map(|bytes| hex(&bytes))
       };
+      #[cfg(any(windows, target_os = "linux"))]
+      let origin = Origin::Thread(Os::current_thread_id());
+      #[cfg(target_os = "macos")]
+      let origin = Origin::Stack(stack());
       phoenix_runtime::remote::record(&Trace::Native(Hit {
-         hook:   id,
-         at:     place(slot.addr.load(Ordering::Relaxed)),
-         args:   args.map(|arg| format!("{arg:#x}")),
-         peek:   args.map(peek),
-         caller: usize::try_from(regs.ret).map_or_else(|_| format!("{:#x}", regs.ret), place),
-         thread: Os::current_thread_id(),
+         hook: id,
+         at: place(slot.addr.load(Ordering::Relaxed)),
+         args: args.map(|arg| format!("{arg:#x}")),
+         peek: args.map(peek),
+         caller: usize::try_from(caller).map_or_else(|_| format!("{caller:#x}"), place),
+         origin,
       }));
+   }
+
+   /// Apple's arm64 ABI keeps a frame record in every function, and the
+   /// hooked one has not pushed its own yet, so the walk from here passes
+   /// through `on_hit` straight into the caller's frames.
+   #[cfg(target_os = "macos")]
+   fn stack() -> Vec<String> {
+      let mut frame: usize;
+      // SAFETY: reads the frame pointer register only.
+      unsafe { std::arch::asm!("mov {}, x29", out(reg) frame) };
+      let mut out = Vec::new();
+      for _ in 0..48 {
+         let Some(record) = Os::read_memory(frame, 16) else {
+            break;
+         };
+         let (next, ret) = record.split_at(8);
+         let next = usize::from_le_bytes(next.try_into().unwrap_or_default());
+         let ret = usize::from_le_bytes(ret.try_into().unwrap_or_default());
+         let at = place(ret);
+         if at.starts_with('+') {
+            out.push(at);
+         }
+         if next <= frame || out.len() >= 24 {
+            break;
+         }
+         frame = next;
+      }
+      out
    }
 }
 
 /// `phoenix.native.hook` where `phoenix_hook::x86::observe` has no stub.
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod observe {
    use phoenix_hook::image::Image;
 

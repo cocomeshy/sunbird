@@ -1284,7 +1284,8 @@ pub fn sret_callee(detour: usize) -> Option<usize> {
 /// `code` in fresh executable memory. `MAP_JIT` pages are the ones macOS lets a
 /// process write code into, one thread's view at a time.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn jit_copy(code: &[u8]) -> Option<usize> {
+#[must_use]
+pub fn jit_copy(code: &[u8]) -> Option<usize> {
    // SAFETY: asks for a fresh anonymous mapping that replaces nothing.
    let page = unsafe {
       libc::mmap(

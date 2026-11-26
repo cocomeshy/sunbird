@@ -245,9 +245,16 @@ byte pattern says nothing about arm32.
   After killed launches, pass `--args -ApplePersistenceIgnoreState YES` or a "reopen windows?"
   alert stalls Discord. A `discord://-/channels/<guild>/<channel>` link opened with `open -a <copy>`
   loads a channel without input.
+- Driving the UI over ssh, in debug builds only (`cargo build -p phoenix-loader`, no `--release`).
+  The debug shell's `GET /ui/screen` returns the front window as a PNG in points, and
+  `POST /ui/input` takes `{"kind":"click","x","y","count"?,"right"?}`, `{"kind":"text","text"}`,
+  `{"kind":"key","key","mods"?}` or `{"kind":"scroll","x","y","dy"}` in the same points. A debug
+  build takes about 90 s to start. GPUI draws nothing while the screen is locked, so keep
+  `caffeinate -d` running. Clicks on message content can open links in the owner's browser.
 - The binary has no symbols. `sigscan strings`/`refs`/`flat` resolve `adrp` pairs and
-  outlined stubs. lldb attaches over ssh once Developer Mode is on (`DevToolsSecurity -enable`).
-  End a wait with `script dbg = lldb.debugger; threading.Timer(n, lambda:
+  outlined stubs. `phoenix.native.hook(addr, limit)` logs each new caller with its frame chain to
+  `/events`. lldb attaches over ssh once Developer Mode is on (`DevToolsSecurity -enable`). End a
+  wait with `script dbg = lldb.debugger; threading.Timer(n, lambda:
   dbg.GetSelectedTarget().GetProcess().SendAsyncInterrupt()).start()`, then `detach`. Never set
   `process handle SIGTRAP -p true`, which kills Discord.
 - `__TEXT` never takes `PROT_WRITE`. `Image::write_code` copies the page with
