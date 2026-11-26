@@ -554,6 +554,14 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "media fetch",
             phoenix_sigs::macos::media_fetch(image).map(at),
          );
+         let composer = phoenix_sigs::macos::composer_buttons(image);
+         report("composer buttons", composer.clone().map(at));
+         report(
+            "gift button",
+            composer
+               .and_then(|composer| phoenix_sigs::macos::gift_button(image, composer))
+               .map(|gift| format!("{gift:x?}")),
+         );
          report(
             "optimistic delete",
             registry

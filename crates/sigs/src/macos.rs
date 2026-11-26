@@ -274,6 +274,63 @@ fn takes_id_pair(image: &Image<'_>, func: usize) -> bool {
       .any(|&insn| matches!(pair(insn), Some((true, _, _, rn, 0)) if Some(rn) == args))
 }
 
+/// The chat bar's button row render, the one function loading the packed
+/// `gift-button` element id that the sticker button's follows. It returns its
+/// `AnyElement` through `x8` and takes `x0`..`x4`.
+pub fn composer_buttons(image: &Image<'_>) -> Found<usize> {
+   let anchors = image.find_bytes(b"gift-buttonchat-sticker-");
+   one("composer buttons", &loaders(image, &anchors))
+}
+
+/// What hides the chat bar's gift button.
+///
+/// `wrap_id` is the `&'static str` of its wrapper's id. `intern` makes an
+/// `ElementId` from text (`x0` text, `x1` length, out through `x8`), and
+/// `id_setter` is `Div::id` (`x0` the `Div`, `x1` the `ElementId`, the
+/// `Stateful<Div>` out through `x8`).
+#[derive(Debug, Clone, Copy)]
+pub struct GiftButton {
+   pub wrap_id:   usize,
+   pub intern:    usize,
+   pub id_setter: usize,
+}
+
+/// [`GiftButton`] in the chat bar render `composer`: the two calls after it
+/// loads each of the button's and its wrapper's ids, which must agree.
+pub fn gift_button(image: &Image<'_>, composer: usize) -> Found<GiftButton> {
+   let body = flattened_at(image, composer);
+   // A call can land on a lone `b` to the function, which leaves no room
+   // for a hook.
+   let through = |call: usize| decode_at(image, call).and_then(pick!(Insn::B { target } => target));
+   let calls_after = |anchor: &[u8]| {
+      let refs = refs_to(image, &image.find_bytes(anchor))
+         .into_iter()
+         .filter(|&(site, _)| image.function_containing(site) == Some(composer))
+         .collect::<Vec<_>>();
+      let [(site, id)] = refs[..] else {
+         return Err(format!("gift button: {} loads of its id", refs.len()));
+      };
+      let mut calls = body
+         .iter()
+         .filter(|&&(pc, _)| pc > site)
+         .filter_map(pick!(&(_, Insn::Bl { target }) => through(target).unwrap_or(target)));
+      match (calls.next(), calls.next()) {
+         (Some(intern), Some(setter)) => Ok((intern, setter, id)),
+         _ => Err("gift button: no id calls after its id".to_owned()),
+      }
+   };
+   let (button_intern, button_setter, _) = calls_after(b"gift-buttonchat-sticker-")?;
+   let (intern, id_setter, wrap_id) = calls_after(b"gift-button.wrap")?;
+   if (button_intern, button_setter) != (intern, id_setter) {
+      return Err("gift button: the button's and wrapper's id calls differ".to_owned());
+   }
+   Ok(GiftButton {
+      wrap_id,
+      intern,
+      id_setter,
+   })
+}
+
 /// `mov w0, #2; ret`: the access function's "no gate".
 pub const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 

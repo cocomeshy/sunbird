@@ -39,25 +39,27 @@ use crate::{
 #[derive(Default)]
 pub struct Desktop<'js> {
    /// `phoenix.ui.addMessageAccessory` callbacks.
-   pub accessories:   RefCell<Vec<DesktopAccessory<'js>>>,
+   pub accessories:      RefCell<Vec<DesktopAccessory<'js>>>,
    /// `phoenix.ui.addMemberDecoration` callbacks.
-   pub members:       RefCell<Vec<DesktopMember<'js>>>,
+   pub members:          RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageHeaderDecoration` callbacks.
-   pub headers:       RefCell<Vec<DesktopMember<'js>>>,
+   pub headers:          RefCell<Vec<DesktopMember<'js>>>,
    /// `phoenix.ui.addMessageAction` callbacks.
-   pub actions:       RefCell<Vec<DesktopAction<'js>>>,
+   pub actions:          RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
-   pub page_buttons:  RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   pub page_buttons:     RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
-   pub emoji_pickers: RefCell<Vec<(u64, String)>>,
+   pub emoji_pickers:    RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.onEvent("rowDoubleTap")` handlers by id and plugin.
-   pub double_taps:   RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub double_taps:      RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
-   pub hides:         RefCell<Vec<(u64, String)>>,
+   pub hides:            RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.hideCount` holds by id and plugin.
    #[cfg(target_arch = "x86_64")]
-   pub hidden_counts: RefCell<Vec<(u64, String, Count)>>,
+   pub hidden_counts:    RefCell<Vec<(u64, String, Count)>>,
+   /// `phoenix.ui.addComposerButton` presses by button id and plugin.
+   pub composer_buttons: RefCell<Vec<(u64, String, Function<'js>)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -116,6 +118,16 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       .page_buttons
       .borrow_mut()
       .retain(|_, (_, plugin, _)| plugin != name);
+
+   let mut buttons = registry.composer_buttons.borrow_mut();
+   let gone = buttons
+      .iter()
+      .filter(|(_, plugin, _)| plugin == name)
+      .map(|(id, ..)| *id)
+      .collect::<Vec<_>>();
+   buttons.retain(|(_, plugin, _)| plugin != name);
+   drop(buttons);
+   composer::remove(&gone);
 
    let mut pickers = registry.emoji_pickers.borrow_mut();
    pickers.retain(|(_, plugin)| plugin != name);

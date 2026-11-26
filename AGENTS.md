@@ -270,6 +270,9 @@ byte pattern says nothing about arm32.
   from the domain tables, in two copies, and dispatches `MESSAGE_DELETE` through the second.
   `MESSAGE_CREATE` is in it with another handler than the domain table's, which never runs.
   `registry.rs` swaps both copies and takes the table's handler.
-- Plugin pages and dialogs are AppKit windows (`ui-desktop/src/macos/panel.rs`).
+- GPUI element ids are interned. An `ElementId` holds a key from the id's text, so a hook matches the
+  key the intern call returned, never the string.
+- Plugin pages and dialogs are AppKit windows (`ui-desktop/src/macos/panel.rs`). Composer buttons draw
+  beside the chat bar.
 - Command-Shift-I opens DevTools through an `NSEvent` local monitor that only sees keys while
   Discord is focused.

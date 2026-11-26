@@ -57,7 +57,10 @@ use crate::{
       self,
       RenderedAccessory,
    },
-   composer,
+   composer::{
+      self,
+      Button,
+   },
    context_menu::{
       self,
       ActionMeta,
@@ -1080,6 +1083,81 @@ fn profile_sections<'js>(
    Ok(sections)
 }
 
+fn add_composer_button<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+   let label = options.get::<_, String>("label")?;
+   let on = options.get::<_, Option<u32>>("tint")?.is_some();
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+   ctx.userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
+      .composer_buttons
+      .borrow_mut()
+      .push((id, plugin.to_owned(), on_press));
+   let state = Rc::new(RefCell::new((label.clone(), on)));
+   composer::set(Button { id, label, on });
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         registry
+            .composer_buttons
+            .borrow_mut()
+            .retain(|(known, ..)| *known != id);
+      }
+      composer::remove(&[id]);
+   })?;
+   remove.set(
+      "update",
+      Function::new(ctx.clone(), move |patch: Object<'js>| {
+         let mut state = state.borrow_mut();
+         if let Some(label) = patch.get::<_, Option<String>>("label")? {
+            state.0 = label;
+         }
+         if patch.contains_key("tint")? {
+            state.1 = patch.get::<_, Option<u32>>("tint")?.is_some();
+         }
+         composer::set(Button {
+            id,
+            label: state.0.clone(),
+            on: state.1,
+         });
+         Ok::<_, rquickjs::Error>(())
+      })?,
+   )?;
+   Ok(remove)
+}
+
+/// Runs the `onPress` of the composer button `id`.
+#[cfg(target_os = "macos")]
+pub fn press_composer_button(id: u64) {
+   let Some(engine) = phoenix_runtime::engine() else {
+      return;
+   };
+   engine.with(|ctx| {
+      let Some((plugin, on_press)) = ctx.userdata::<Desktop<'_>>().and_then(|registry| {
+         let buttons = registry.composer_buttons.borrow();
+         let (_, plugin, func) = buttons.iter().find(|(known, ..)| *known == id)?;
+         Some((plugin.clone(), func.clone()))
+      }) else {
+         return;
+      };
+      let context = Object::new(ctx.clone()).and_then(|context| {
+         context.set("channelId", Value::new_null(ctx.clone()))?;
+         context.set("currentUserId", Value::new_null(ctx.clone()))?;
+         Ok(context)
+      });
+      let result = context.and_then(|context| on_press.call::<_, Value<'_>>((context,)));
+      if let Err(err) = result.catch(&ctx) {
+         log::error!("[{plugin}] composer button onPress: {err}");
+      }
+   });
+}
+
 /// `phoenix.ui.hide`. Desktop knows one id, the composer's gift button.
 fn hide<'js>(ctx: &Ctx<'js>, plugin: &str, id: &str) -> rquickjs::Result<Function<'js>> {
    static NEXT_HIDE: AtomicU64 = AtomicU64::new(1);
@@ -1295,6 +1373,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
 
+   let composer_owner = plugin.to_owned();
+   ui.set(
+      "addComposerButton",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_composer_button(&ctx, &composer_owner, &options)
+      })?,
+   )?;
+
    let hide_owner = plugin.to_owned();
    ui.set(
       "hide",
@@ -1317,7 +1403,6 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
    // plugins load without throwing on desktop.
    for slot_fn in [
       "addHeaderButton",
-      "addComposerButton",
       "addProfileSection",
       "patchProps",
       "onNode",

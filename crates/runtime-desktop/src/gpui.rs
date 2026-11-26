@@ -999,6 +999,26 @@ pub fn raw_div() -> Option<RawDiv> {
    Some(Builder { sym }.raw_div())
 }
 
+/// [`style_div`] on a `Div` Discord built, which has no room past its own size.
+///
+/// # Safety
+///
+/// `div` is a live `Div` or `Stateful<Div>`.
+#[cfg(target_os = "macos")]
+pub unsafe fn style_discord_div(div: *mut u8, f: impl FnOnce(&Style)) {
+   let Some(sym) = SYMBOLS.get() else {
+      return;
+   };
+   // SAFETY: `div_style_mut` only follows the `Div`'s boxed `Interactivity`.
+   let ptr = unsafe { (sym.div_style_mut)(div.cast()) };
+   if !ptr.is_null() {
+      f(&Style {
+         ptr,
+         at: &sym.layout.style,
+      });
+   }
+}
+
 pub fn style_div(div: &mut RawDiv, f: impl FnOnce(&Style)) {
    if let Some(sym) = SYMBOLS.get() {
       Builder { sym }.style_div(div, f);
@@ -1430,6 +1450,7 @@ const DESKTOP_FULL: &[&str] = &[
    "no-profile-themes",
    "no-reply-mention",
    "spoiler-mode",
+   "hide-composer-buttons",
    "text-replace",
    "view-raw",
    "global-badges",
@@ -1442,7 +1463,7 @@ const DESKTOP_FULL: &[&str] = &[
 
 const DESKTOP_PARTIAL: &[&str] = &["fakenitro"];
 
-const MOBILE_ONLY: &[&str] = &["hide-composer-buttons", "reviewdb", "taptap", "example"];
+const MOBILE_ONLY: &[&str] = &["reviewdb", "taptap", "example"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DesktopCompat {

@@ -189,6 +189,7 @@ pub fn prepare() -> Result<(), Error> {
    #[cfg(target_os = "macos")]
    {
       message::writer::install();
+      composer::hooks::install(&image);
       log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
    }
    <os::Os as os::DesktopOs>::install(&image);
