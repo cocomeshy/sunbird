@@ -16,6 +16,7 @@ mod context_menu;
 #[cfg(target_arch = "x86_64")]
 mod counts;
 mod discord;
+mod discord_version;
 mod double_click;
 mod emoji;
 mod fetch;
@@ -555,6 +556,7 @@ impl Platform for Desktop {
          phoenix_ui_desktop::DEVTOOLS_SHORTCUT
       );
       phoenix_ui_desktop::notify("Sunbird ready", Some(&ready_body));
+      std::thread::spawn(discord_version::check);
       let config = config::load();
       if config.auto_update {
          std::thread::spawn(|| {
