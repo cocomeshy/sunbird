@@ -47,6 +47,11 @@ use rquickjs::{
    },
 };
 
+#[cfg(target_arch = "x86_64")]
+use crate::counts::{
+   self,
+   Count,
+};
 use crate::{
    accessories::{
       self,
@@ -56,10 +61,6 @@ use crate::{
    context_menu::{
       self,
       ActionMeta,
-   },
-   counts::{
-      self,
-      Count,
    },
    double_click,
    emoji,
@@ -1520,6 +1521,7 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
 }
 
 /// `phoenix.ui.hideCount`, until the returned remover runs.
+#[cfg(target_arch = "x86_64")]
 fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result<Function<'js>> {
    static NEXT_HIDE: AtomicU64 = AtomicU64::new(1);
 
@@ -1544,6 +1546,12 @@ fn hide_count<'js>(ctx: &Ctx<'js>, plugin: &str, name: &str) -> rquickjs::Result
       hidden.retain(|&(held, ..)| held != hold);
       counts::hide(hidden.iter().map(|&(.., count)| count));
    })
+}
+
+/// macOS has no pending count locators yet, so the counts stay.
+#[cfg(not(target_arch = "x86_64"))]
+fn hide_count<'js>(ctx: &Ctx<'js>, _plugin: &str, _name: &str) -> rquickjs::Result<Function<'js>> {
+   noop_handle(ctx)
 }
 
 pub fn on_send<'js>(

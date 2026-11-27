@@ -273,9 +273,9 @@ mod tests {
       }
 
       let image = Image {
-         path:          "Discord.exe".to_owned(),
-         build_id:      None,
-         segments:      vec![
+         path:            "Discord.exe".to_owned(),
+         build_id:        None,
+         segments:        vec![
             Segment {
                addr:       text_base,
                bytes:      Cow::Borrowed(&text),
@@ -289,10 +289,11 @@ mod tests {
                writable:   false,
             },
          ],
-         eh_frame_hdr:  None,
-         arm_exidx:     None,
-         pdata:         Some((text_base, rdata_base + pdata_off, pdata_len)),
-         pointer_width: 8,
+         eh_frame_hdr:    None,
+         arm_exidx:       None,
+         pdata:           Some((text_base, rdata_base + pdata_off, pdata_len)),
+         function_starts: None,
+         pointer_width:   8,
       };
 
       let found = DesktopGatewaySend::locate(&image).expect("should locate SocketSink");

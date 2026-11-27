@@ -15,14 +15,15 @@ use rquickjs::{
    JsLifetime,
 };
 
+#[cfg(target_arch = "x86_64")]
+use crate::counts::{
+   self,
+   Count,
+};
 use crate::{
    accessories,
    composer,
    context_menu,
-   counts::{
-      self,
-      Count,
-   },
    double_click,
    emoji,
    js::ui::{
@@ -55,6 +56,7 @@ pub struct Desktop<'js> {
    /// `phoenix.ui.hide` holds by id and plugin.
    pub hides:         RefCell<Vec<(u64, String)>>,
    /// `phoenix.ui.hideCount` holds by id and plugin.
+   #[cfg(target_arch = "x86_64")]
    pub hidden_counts: RefCell<Vec<(u64, String, Count)>>,
 }
 
@@ -133,7 +135,10 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       !held
    });
 
-   let mut hidden = registry.hidden_counts.borrow_mut();
-   hidden.retain(|(_, plugin, _)| plugin != name);
-   counts::hide(hidden.iter().map(|&(.., count)| count));
+   #[cfg(target_arch = "x86_64")]
+   {
+      let mut hidden = registry.hidden_counts.borrow_mut();
+      hidden.retain(|(_, plugin, _)| plugin != name);
+      counts::hide(hidden.iter().map(|&(.., count)| count));
+   }
 }

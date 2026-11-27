@@ -2,12 +2,17 @@
 //! Sunbird pages in User Settings, message accessories, member list
 //! decorations and the tray.
 
-#![cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#![cfg(any(
+   windows,
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "x86_64")
+))]
 
 mod accessories;
 mod badges;
 mod composer;
 mod context_menu;
+#[cfg(target_arch = "x86_64")]
 mod counts;
 mod discord;
 mod double_click;
@@ -41,7 +46,10 @@ use std::{
    time::Duration,
 };
 
-use phoenix_hook::image::Image;
+use phoenix_hook::{
+   image::Image,
+   x86::Abi,
+};
 use phoenix_runtime::{
    Error,
    Notice,
@@ -66,7 +74,13 @@ use phoenix_runtime::{
       StoreError,
    },
 };
-use phoenix_sigs::registry::GatewayRegistry;
+use phoenix_sigs::{
+   desktop::{
+      Prologue,
+      Prologues,
+   },
+   registry::GatewayRegistry,
+};
 use rquickjs::{
    Ctx,
    Object,
@@ -101,11 +115,45 @@ struct DialogAnswer {
    index: i32,
 }
 
+/// Whether Discord's code is x86-64, which every locator in
+/// `phoenix_sigs::desktop` and `http` decodes. macOS Phoenix is arm64 only, so
+/// there they are never run, an x86 patch can never land in arm64 code, and
+/// what they locate stays off.
+pub(crate) const X86_CODE: bool = cfg!(all(target_arch = "x86_64", not(target_os = "macos")));
+
+/// Hooks `target` with `detour` past the prologue `pick` chooses, and returns
+/// the trampoline as `F`, or logs the error after `what`.
+///
+/// # Safety
+///
+/// Runs before Discord's threads reach `target`, `detour` has its ABI, and `F`
+/// is its function pointer type.
+pub(crate) unsafe fn hook<F: Copy>(
+   image: &Image<'static>,
+   pick: fn(Prologues) -> Prologue,
+   target: usize,
+   detour: usize,
+   what: &str,
+) -> Option<F> {
+   const { assert!(size_of::<F>() == size_of::<usize>()) };
+   let prologue = pick(Prologues::of(Abi::of(image)));
+   // SAFETY: forwarded from the caller.
+   match unsafe { image.hook_entry(target, prologue.pattern, prologue.len, detour) } {
+      // SAFETY: the trampoline runs `target`'s displaced instructions, so it
+      // has `F`'s ABI.
+      Ok(trampoline) => Some(unsafe { std::mem::transmute_copy::<usize, F>(&trampoline) }),
+      Err(err) => {
+         log::warn!("{what}: {err}");
+         None
+      },
+   }
+}
+
 /// The target and its swapped gateway registry, once [`prepare`] hooked them.
 static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mutex::new(None);
 
-/// Hooks Discord from `DllMain` on Windows or the `.init_array` constructor on
-/// Linux, before its own code runs.
+/// Hooks Discord from `DllMain` on Windows or the constructor on Linux and
+/// macOS, before its own code runs.
 ///
 /// Desktop Phoenix settles on the access gate in its first frames and stops
 /// reading the gateway registry and HTTP vtables once started, so hooks swapped
@@ -115,24 +163,34 @@ pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
+   settings::install(&image);
    #[cfg(windows)]
    restart::install(&image);
    staff::prepare(&image);
-   settings::install(&image);
-   modal::install(&image);
+   if X86_CODE {
+      modal::install(&image);
+   }
+   context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
-   let header = headers::locate(&image);
+   let header = X86_CODE.then(|| headers::locate(&image));
    accessories::install(&image);
-   members::install(&image);
-   headers::install(&image, header);
-   icons::install(&image);
-   context_menu::install(&image);
-   message::install(&image);
+   if let Some(header) = header {
+      members::install(&image);
+      headers::install(&image, header);
+      icons::install(&image);
+      message::install(&image);
+      composer::install(&image);
+      #[cfg(target_arch = "x86_64")]
+      counts::install(&image);
+   }
    badges::install(&image);
    emoji::install(&image);
-   composer::install(&image);
-   counts::install(&image);
+   #[cfg(target_os = "macos")]
+   {
+      message::writer::install();
+      log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
+   }
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
@@ -183,8 +241,15 @@ fn open_access_gate(image: &Image<'static>) {
    /// `mov al, 2; ret`
    const ALLOWED: [u8; 3] = [0xB0, 0x02, 0xC3];
 
-   let access = match phoenix_sigs::desktop::access_gate(image) {
-      Ok(access) => access,
+   let found = if X86_CODE {
+      phoenix_sigs::desktop::access_gate(image).map(|access| (access, &ALLOWED[..]))
+   } else {
+      close_enforced(image);
+      phoenix_sigs::macos::access_gate(image)
+         .map(|access| (access, &phoenix_sigs::macos::NO_GATE[..]))
+   };
+   let (access, allowed) = match found {
+      Ok(found) => found,
       Err(err) => {
          log::warn!("access gate: {err}, leaving it");
          return;
@@ -192,9 +257,23 @@ fn open_access_gate(image: &Image<'static>) {
    };
    // SAFETY: Discord's own code, written from `DllMain` or the constructor
    // before it runs.
-   match unsafe { image.write_code(access, &ALLOWED) } {
+   match unsafe { image.write_code(access, allowed) } {
       Ok(()) => log::info!("access gate: open"),
       Err(err) => log::error!("access gate: {err}"),
+   }
+}
+
+/// Makes macOS's `client_access::enforced` answer false. `push_access` asks it
+/// without the access function and drops every message alert for a gated
+/// account, notifications and their sounds included.
+fn close_enforced(image: &Image<'static>) {
+   let enforced = phoenix_sigs::macos::access_read(image)
+      .and_then(|read| phoenix_sigs::macos::access_enforced(image, read));
+   // SAFETY: as for the access function in `open_access_gate`.
+   match enforced.map(|at| unsafe { image.write_code(at, &phoenix_sigs::macos::NOT_ENFORCED) }) {
+      Ok(Ok(())) => log::info!("access gate: not enforced, message alerts are on"),
+      Ok(Err(err)) => log::error!("access gate: {err}"),
+      Err(err) => log::warn!("access gate: {err}, message alerts stay off"),
    }
 }
 
@@ -275,7 +354,11 @@ impl Platform for Desktop {
       });
       phoenix_ui_desktop::notify(
          "Sunbird ready",
-         Some("Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"),
+         Some(if X86_CODE {
+            "Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"
+         } else {
+            "Sunbird's settings are in its menu bar item"
+         }),
       );
       phoenix_runtime::update::check();
    }

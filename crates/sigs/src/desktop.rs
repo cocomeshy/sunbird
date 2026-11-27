@@ -1116,6 +1116,7 @@ pub fn settings_section(image: &Image<'_>) -> Found<Section> {
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.
+#[derive(Debug, Clone)]
 pub struct Gpui {
    /// The `Location` `div_new` takes, a static in `.rdata`.
    pub caller_loc:       usize,
@@ -1421,7 +1422,6 @@ fn debug_offsets(image: &Image<'_>, func: usize, depth: usize) -> HashMap<String
 
 /// `<StyleRefinement as Debug>::fmt`, the one loader of a `StyleRefinement`
 /// literal that prints `text`, `padding` and `gap`.
-#[expect(clippy::too_many_lines, reason = "one line per decoded field")]
 fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
    let leas = string_leas(image, &[b"StyleRefinement"]);
    let mut funcs: Vec<usize> = leas
@@ -1446,6 +1446,15 @@ fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
          found.len()
       ));
    };
+   style_from_fields(fields, bytes)
+}
+
+/// [`StyleOffsets`] from `StyleRefinement`'s fields by name, as either
+/// architecture's `Debug` reader returns them, checked against its size.
+pub(crate) fn style_from_fields(
+   fields: &HashMap<String, usize>,
+   bytes: usize,
+) -> Found<StyleOffsets> {
    let get = |name: &str| -> Found<usize> {
       fields
          .get(name)
@@ -4332,12 +4341,9 @@ pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
    Ok(func)
 }
 
-/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
-///
-/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
-/// and the desktop runtime hooks the function to unwrap custom badge icon
-/// URLs (`/badge-icons/phx_u_<hex>`).
-pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+/// The `tracing::Callsite` static naming `"media_fetch"` /
+/// `"libdiscord_media::fetch"`, the same data on every platform.
+pub(crate) fn media_fetch_callsite(image: &Image<'_>) -> Found<usize> {
    let name = one(
       "media_fetch tracing name",
       &image.find_bytes(b"media_fetchlibdiscord_media::fetch"),
@@ -4369,8 +4375,16 @@ pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
          pos = off + 8;
       }
    }
-   let callsite = one("media_fetch callsite", &callsites)?;
+   one("media_fetch callsite", &callsites)
+}
 
+/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
+///
+/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
+/// and the desktop runtime hooks the function to unwrap custom badge icon
+/// URLs (`/badge-icons/phx_u_<hex>`).
+pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+   let callsite = media_fetch_callsite(image)?;
    let mut funcs: Vec<usize> = lea_refs(image, callsite)
       .into_iter()
       .filter_map(|site| Some(image.function_bounds(site)?.0))
@@ -4475,6 +4489,60 @@ fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + 
          (addr + pos + 6).checked_add_signed(disp as isize)?,
       ))
    })
+}
+
+/// Mana's icon names in id order: a `MenuItem`'s icon is the index of its
+/// name in this list.
+///
+/// The icon table pairs each name with `icons/<Name>.svg`; the paths are read
+/// in a run from `icons/A.svg`, and the ids are their names sorted, which
+/// Discord's own menu icons (`Copy` 0x99, `Id` 0x15b, `Link` 0x177, `Trash`
+/// 0x280 on 2026-11 builds) confirm.
+pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
+   /// How far apart two paths in the table may sit, a name between them.
+   const GAP: usize = 128;
+   let start = image
+      .find_bytes_iter(b"icons/A.svg")
+      .next()
+      .ok_or("icon table not found")?;
+   let mut names = Vec::new();
+   let mut at = start;
+   while let Some(window) = image.read(at, GAP) {
+      let Some(path) = window.windows(6).position(|w| w == b"icons/") else {
+         break;
+      };
+      let Some(rest) = image.read(at + path + 6, GAP) else {
+         break;
+      };
+      let Some(end) = rest.windows(4).position(|w| w == b".svg") else {
+         break;
+      };
+      let Ok(name) = std::str::from_utf8(&rest[..end]) else {
+         break;
+      };
+      at += path + 6 + end + 4;
+      // `Name.secondary.svg` is a second layer of `Name`, with no id.
+      if name.contains('.') {
+         continue;
+      }
+      if !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+         || (name == "A" && !names.is_empty())
+      {
+         break;
+      }
+      names.push(name.to_owned());
+   }
+   names.sort_unstable();
+   names.dedup();
+   let has = |name: &str| {
+      names
+         .binary_search_by(|probe| probe.as_str().cmp(name))
+         .is_ok()
+   };
+   if names.len() < 100 || !["Copy", "Id", "Link", "Trash"].into_iter().all(has) {
+      return Err(format!("icon table holds {} names", names.len()));
+   }
+   Ok(names)
 }
 
 #[cfg(test)]

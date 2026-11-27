@@ -21,7 +21,7 @@ use crate::Found;
 
 /// Unique error string inside `ReqwestTransport::send` when handed a mobile
 /// host-file body.
-const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
+pub(crate) const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
 
 /// The size of `http::HeaderMap`, which `send`'s request starts with.
 pub const HEADER_MAP_SIZE: usize = 0x60;
@@ -234,7 +234,7 @@ fn response_layout(abi: Abi, code: &[u8], ip: usize) -> Found<ResponseLayout> {
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
 /// where `[drop_fn, size, align, method_fn]` passes Rust trait vtable checks.
-fn find_vtable_method_slots(
+pub(crate) fn find_vtable_method_slots(
    image: &Image<'_>,
    method_fn: usize,
    size_range: std::ops::RangeInclusive<usize>,

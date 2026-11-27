@@ -38,7 +38,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 
 | Path | What |
 |---|---|
-| `crates/loader` | `libphoenix.so`, injected into the APK as `libplm.so`. Its constructor starts the runtime. On macOS it only opens Desktop Phoenix's access gate, since the Desktop hooks decode x86-64 and the Mac app is arm64. |
+| `crates/loader` | `libphoenix.so`, injected into the APK as `libplm.so`. Its constructor starts the runtime. |
 | `crates/runtime` | QuickJS plugin runtime and the `phoenix` API every platform shares. `phoenix.d.ts` is the plugin API reference. `platform.rs` is the `Platform` trait the platform crates implement. |
 | `crates/runtime/src/gateway.rs` | Gateway event hooks by swapping handler pointers in Phoenix's event registry. |
 | `crates/runtime/src/discord.rs` | `phoenix.discord`, Discord's API with Phoenix's own session. The platforms carry the requests. |
@@ -52,9 +52,9 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `crates/runtime-mobile/src/host.rs` | Phoenix's host call, event and field numbers, read at startup from the name table in the installed APK's dex, or the host's Swift name table on iOS. `host::send` and `host::ask` call host modules. |
 | `crates/runtime-mobile/src/picker.rs` | File picker, toasts, clipboard and links through Phoenix's host modules. |
 | `crates/runtime-mobile/src/install.rs`, `loader.rs` | The APK self-update, and Android's installer opened on it through Discord's `FileProvider`. |
-| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. |
+| `crates/runtime-desktop` | phoenix on Desktop Phoenix (`Discord.exe`, Linux `discord-phoenix`, macOS `Discord`): the access gate, the HTTP transport hooks, the Sunbird pages in User Settings, message accessories and the tray. `os.rs` holds what differs per OS. On macOS, which is arm64, everything runs (see Host facts). |
 | `crates/ui-mobile` | Typed codec for mobile (Android/iOS) Phoenix UI-op batches. `src/props.in` is Phoenix's prop table, `templates.json` holds captured layouts, `motion.rs` drives native springs, `mirror.rs` keeps a live copy of the view tree that host tests can drive. |
-| `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, GPUI surface hooks). |
+| `crates/ui-desktop` | Desktop UI host primitives (clipboard, URLs, notifications, the tray, GPUI surface hooks), one file per OS. |
 | `crates/wire` | Tagged values and bridge frames (`HostCall`, `DispatchEvent`). |
 | `crates/hook` | Image scanner, `swap_words`, ShadowHook through `sunhook-sys` on Android ARM. |
 | `crates/sigs`, `crates/sigscan` | The gateway registry walk and handler ABI, and every other locator the runtime patches from (`desktop.rs`, `mobile.rs`, `macos.rs`). `sigscan` dumps a library's registry, runs `check` (every locator for that platform, exit 1 on a miss) and looks up strings, references and disassembly in `Discord.exe`. |
@@ -66,6 +66,7 @@ Read this file before changing code. Every fact here cost someone hours to learn
 | `web/` | What CI deploys to assets.sunbird.tools, with a `site.tar.gz` of it that sunbird-tools/site builds from: patcher wasm, loader libraries, plugin bundles, `version.json`. Builds before 76bc0d7 fetch the last three from sunbird.tools, so the site keeps serving them at the same paths. |
 | `frida/` | Optional Frida gadget bootstrap, for debugging on x86. |
 | `scripts/*.nu` | `phoenix.nu` builds, patches and installs on a phone. `site.nu` builds the site's native libs and wasm. |
+| `scripts/sunbird-{linux,macos}.sh` | The Desktop installers the site serves. Each makes a launcher that fetches the loader before every start and leaves Discord's own files untouched. |
 | `scripts/dev.ps1` | The Windows dev loop, described below. |
 
 ## Building
@@ -89,6 +90,10 @@ Read this file before changing code. Every fact here cost someone hours to learn
     then `cargo build --release -p patcher`.
 - iOS. `.github/workflows/ios.yml` builds `libphoenix.dylib` for `aarch64-apple-ios` on macOS,
   since the SDK ships only with Xcode.
+- macOS. `cargo build --release -p phoenix-loader` builds `target/release/libphoenix.dylib` for
+  Desktop Phoenix. Install it with `SUNBIRD_SITE=http://127.0.0.1:<port> sh scripts/sunbird-macos.sh`
+  against a local folder serving `version.json` and `plugins/libphoenix-macos-arm64.dylib`, or start
+  the copy it makes by hand (below). `sigscan` builds natively on Apple silicon.
 - Site. `nu scripts/site.nu web` and `node web/tools/bundle-plugins.ts` (set `ESBUILD`
   if esbuild is not on `PATH`), then `nu scripts/fetch.nu <this checkout>` in sunbird-tools/site.
   CI deploys the same files to assets.sunbird.tools on pushes to `main`, and the site picks them up within 10 minutes.
@@ -215,3 +220,49 @@ byte pattern says nothing about arm32.
   composer.
 - QuickJS has no `URLSearchParams`. Check any other web global before a plugin uses it.
 - Discord payload shapes are documented at https://docs.discord.food/.
+
+### macOS Desktop
+
+- `Discord Phoenix.app` has the hardened runtime, so dyld ignores `DYLD_INSERT_LIBRARIES`.
+  `sunbird-macos.sh` clones it (`cp -c`, free on APFS) into
+  `~/Library/Application Support/Sunbird/Sunbird.app`, renames it, sets `DYLD_INSERT_LIBRARIES` and
+  `SUNBIRD` in its Info.plist `LSEnvironment`, and signs it ad hoc. Discord relaunches itself with a
+  bare `open -n`, which would lose a launcher's `--env`. After an update the loader rewrites
+  Discord's relaunch script to open `$SUNBIRD`, the launcher, which re-signs the newer copy. A
+  second Discord hands off to a running one, so the launcher first quits any copy without
+  `libphoenix` mapped.
+- Patching Discord Phoenix in place was rejected. Writing into the bundle needs App Management with
+  SIP on, dyld refuses to start it when the library is missing, and each update swaps the bundle.
+  A Developer ID can't help, since Discord's keychain and App Group entitlements are bound to its
+  team id.
+- Phoenix re-execs itself once with its malloc settings and `DISCORD_DESKTOP_MALLOC_REEXEC=1`
+  unless `LSEnvironment` already set them. The loader starts only in the last image. With SIP off,
+  dyld kills any arm64e child (`osascript`, `nohup`) that inherits an arm64 library.
+- Data lives in `~/Library/Application Support/libdiscord` (or `LIBDISCORD_DATA_DIR`), Sunbird's home
+  in its `sunbird/`. Tokens are in the login keychain, so a copy pointed at another data directory
+  still logs in to the owner's accounts.
+- Logs go to the unified log: `/usr/bin/log stream --predicate 'eventMessage CONTAINS "phoenix:"'`.
+  After killed launches, pass `--args -ApplePersistenceIgnoreState YES` or a "reopen windows?"
+  alert stalls Discord. A `discord://-/channels/<guild>/<channel>` link opened with `open -a <copy>`
+  loads a channel without input.
+- The binary has no symbols. `sigscan strings`/`refs`/`flat` resolve `adrp` pairs and
+  outlined stubs. lldb attaches over ssh once Developer Mode is on (`DevToolsSecurity -enable`).
+  End a wait with `script dbg = lldb.debugger; threading.Timer(n, lambda:
+  dbg.GetSelectedTarget().GetProcess().SendAsyncInterrupt()).start()`, then `detach`. Never set
+  `process handle SIGTRAP -p true`, which kills Discord.
+- `__TEXT` never takes `PROT_WRITE`. `Image::write_code` copies the page with
+  `vm_protect(VM_PROT_COPY)`. The arm64 `hook_entry` overwrites 4 instructions with
+  `ldr x16,#8; br x16; .quad` and refuses literal loads or branches back into them, so a target that
+  is a lone `b` must be followed first.
+- Calling convention. x86 passes a large return's slot first, arm64 in `x8`. gpui.rs and the
+  detours are written the x86 way, so calls out go through `image::sret_caller` and detours are
+  entered through `image::sret_callee`.
+- `Pattern::new` panics without a literal byte, and a panic in the loader's constructor aborts
+  Discord. Pass the x86 frame prologue to the arm64 `hook_entry`, which ignores it.
+- Gateway registry. macOS keeps message, reaction, presence and typing events in a flat table apart
+  from the domain tables, in two copies, and dispatches `MESSAGE_DELETE` through the second.
+  `MESSAGE_CREATE` is in it with another handler than the domain table's, which never runs.
+  `registry.rs` swaps both copies and takes the table's handler.
+- Plugin pages and dialogs are AppKit windows (`ui-desktop/src/macos/panel.rs`).
+- Command-Shift-I opens DevTools through an `NSEvent` local monitor that only sees keys while
+  Discord is focused.
