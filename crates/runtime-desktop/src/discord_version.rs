@@ -97,7 +97,7 @@ fn compare(installed: &str, supported: &str) -> Option<Ordering> {
    Some(parts(installed)?.cmp(&parts(supported)?))
 }
 
-/// The AppImage's version, from the desktop entry its runtime mounts at
+/// The `AppImage`'s version, from the desktop entry its runtime mounts at
 /// `APPDIR`.
 #[cfg(target_os = "linux")]
 fn installed() -> Option<String> {
