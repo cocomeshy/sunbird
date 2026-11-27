@@ -65,6 +65,7 @@
 !scripts/*.sh
 
 !web/
+!web/discord.json
 !web/tools/
 !web/tools/*.ts
 !web/plugins/

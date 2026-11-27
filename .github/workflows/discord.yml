@@ -35,7 +35,7 @@ jobs:
       - id: latest
         run: |
           alpha=$(curl -fsS "$TRACKER/index" | jq -r .latest.alpha)
-          ready=$(jq -r '.versionCode // 0' web/discord.json 2>/dev/null || echo 0)
+          ready=$(jq -r '.android.versionCode // 0' web/discord.json 2>/dev/null || echo 0)
           release=$(git describe --tags --abbrev=0)
           echo "tracker alpha $alpha, ready $ready, release $release"
           echo "release=$release" >> "$GITHUB_OUTPUT"
@@ -89,7 +89,11 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: discord
-          path: web
+          path: ${{ runner.temp }}
+      # Only the Android build is CI's; the desktop builds are kept by hand.
+      - run: |
+          jq --slurpfile android "$RUNNER_TEMP/discord.json" '.android = $android[0]' web/discord.json > "$RUNNER_TEMP/merged.json"
+          mv "$RUNNER_TEMP/merged.json" web/discord.json
       - env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}

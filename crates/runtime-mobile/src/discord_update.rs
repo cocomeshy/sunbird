@@ -40,10 +40,10 @@ use sha2::{
    Sha256,
 };
 
-/// Where CI publishes the builds that passed, read from main so a ready
-/// build needs no site release.
-const BUILDS: &str =
-   "https://raw.githubusercontent.com/sunbird-tools/sunbird/main/web/discord.json";
+/// `web/discord.json` on main, where CI publishes the builds that passed, so a
+/// ready build needs no site release. A worker on the assets host serves it,
+/// sparing phones raw.githubusercontent.com's rate limits.
+const BUILDS: &str = "https://assets.sunbird.tools/discord.json";
 /// Under [`fetch::LIMIT`], which caps one response.
 const CHUNK: usize = 4 << 20;
 /// This phone's ABI split and the directory its libraries sit in.
@@ -65,7 +65,14 @@ const DENSITIES: [(&str, u32); 7] = [
    ("xxxhdpi", 640),
 ];
 
-/// A build `web/discord.json` lists.
+/// `web/discord.json`: the Android build CI checked, if any, beside the
+/// desktop builds kept by hand.
+#[derive(serde::Deserialize)]
+struct Builds {
+   android: Option<Build>,
+}
+
+/// The Android build `web/discord.json` lists.
 #[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Build {
@@ -275,8 +282,11 @@ fn newer() -> Result<Option<Build>, String> {
       return Ok(None);
    }
    let body = fetch::get(BUILDS).map_err(|err| err.to_string())?;
-   let build =
-      serde_json::from_slice::<Build>(&body).map_err(|err| format!("discord.json: {err}"))?;
+   let builds =
+      serde_json::from_slice::<Builds>(&body).map_err(|err| format!("discord.json: {err}"))?;
+   let Some(build) = builds.android else {
+      return Ok(None);
+   };
    if !build.url.starts_with("https://") {
       return Err(format!("discord.json: {} is not https", build.url));
    }
