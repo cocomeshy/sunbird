@@ -195,6 +195,23 @@ pub const LOCATORS: &[Locator] = &[
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
    Locator {
+      name:     "scene draw",
+      families: DESKTOP,
+      run:      |ix| {
+         mana_theme::scene_draw(ix).and_then(|found| {
+            Ok(format!(
+               "draw {}, quads +{:#x}, shadows {}",
+               hookable(ix, found.draw)?,
+               found.quads,
+               found
+                  .shadows
+                  .map_or_else(|| "off".to_owned(), |at| format!("+{at:#x}"))
+            ))
+         })
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
       name:     "optimistic delete",
       families: DESKTOP,
       run:      |ix| {

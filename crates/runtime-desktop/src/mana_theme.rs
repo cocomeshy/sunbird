@@ -23,6 +23,7 @@ use std::{
       PoisonError,
       atomic::{
          AtomicBool,
+         AtomicU32,
          AtomicUsize,
          Ordering,
       },
@@ -87,6 +88,26 @@ impl Hooks {
 static ORIG_SET_GLOBAL: AtomicUsize = AtomicUsize::new(0);
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
 static PENDING_APPLY: AtomicBool = AtomicBool::new(false);
+/// Lock-free active `--radius-scale` factor (`f32::NAN` bits = unset), synced
+/// from the resolved active mode's palette.
+static RADIUS_SCALE: AtomicU32 = AtomicU32::new(f32::NAN.to_bits());
+
+/// Lock-free cached `SunbirdPalette` RGBA words, refreshed once whenever
+/// `active_colors` changes so GPUI render passes never lock `STATE` or call
+/// `SemanticColors::get_mut`.
+static PALETTE_CACHE: [AtomicU32; 8] = {
+   let d = SunbirdPalette::DEFAULT.to_rgba_words();
+   [
+      AtomicU32::new(d[0]),
+      AtomicU32::new(d[1]),
+      AtomicU32::new(d[2]),
+      AtomicU32::new(d[3]),
+      AtomicU32::new(d[4]),
+      AtomicU32::new(d[5]),
+      AtomicU32::new(d[6]),
+      AtomicU32::new(d[7]),
+   ]
+};
 
 thread_local! {
    static IN_DETOUR: Cell<bool> = const { Cell::new(false) };
@@ -167,7 +188,7 @@ impl CachedSpec {
    fn from_spec(spec: &ThemeSpec) -> Option<Self> {
       let dark = spec.resolve(ThemeMode::Dark);
       let light = spec.resolve(ThemeMode::Light);
-      (!dark.tokens.is_empty() || !light.tokens.is_empty()).then_some(Self { dark, light })
+      (dark.is_active() || light.is_active()).then_some(Self { dark, light })
    }
 
    const fn for_mode(&self, base_mode: ThemeMode) -> &ResolvedPalette {
@@ -209,22 +230,26 @@ struct ThemeState {
    active_mode:       ThemeMode,
    /// Fixed rotating ring of 8-byte-aligned owned `SemanticColors` buffers
    /// handed to Discord via tag 0. Slots are allocated once and never move.
-   color_ring:        Vec<Box<[u64]>>,
-   ring_next:         usize,
+   color_ring:          Vec<Box<[u64]>>,
+   ring_next:           usize,
+   /// Last `--radius-scale` bit pattern flushed on the UI thread, so
+   /// radius-only edits still trigger a GPUI window refresh.
+   flushed_radius_bits: u32,
 }
 
 impl Default for ThemeState {
    fn default() -> Self {
       Self {
-         home:              None,
-         config:            ThemeConfig::default(),
-         active_spec:       None,
-         base:              None,
-         patched_installed: false,
-         active_colors:     None,
-         active_mode:       ThemeMode::Dark,
-         color_ring:        Vec::new(),
-         ring_next:         0,
+         home:                None,
+         config:              ThemeConfig::default(),
+         active_spec:         None,
+         base:                None,
+         patched_installed:   false,
+         active_colors:       None,
+         active_mode:         ThemeMode::Dark,
+         color_ring:          Vec::new(),
+         ring_next:           0,
+         flushed_radius_bits: f32::NAN.to_bits(),
       }
    }
 }
@@ -393,13 +418,14 @@ pub fn load_persisted(home: &Path) {
    let cached = loaded.as_ref().and_then(CachedSpec::from_spec);
    if loaded.is_some() && cached.is_none() {
       log::warn!(
-         "mana theme: saved theme {:?} sets no supported color tokens, ignoring",
+         "mana theme: saved theme {:?} sets no supported theme tokens, ignoring",
          config.active
       );
    }
    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
    state.home = Some(home.to_owned());
    state.config = config;
+   sync_radius_scale_for_state(&state, cached.as_ref());
    state.active_spec = cached;
    let should_flush = state.base.is_some();
    drop(state);
@@ -421,6 +447,7 @@ pub fn set_css(css: &str) -> bool {
    let cached = CachedSpec::from_spec(&ThemeSpec::parse_css(css));
    let active = cached.is_some();
    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   sync_radius_scale_for_state(&state, cached.as_ref());
    state.active_spec = cached;
    drop(state);
    request_apply();
@@ -432,9 +459,10 @@ pub fn set_css(css: &str) -> bool {
 pub fn apply_file_ephemeral(themes_dir: &Path, file: &str) -> Result<bool, String> {
    let parsed = read_theme_file(themes_dir, file)?;
    let Some(cached) = CachedSpec::from_spec(&parsed) else {
-      return Err(format!("theme {file} sets no supported color tokens"));
+      return Err(format!("theme {file} sets no supported tokens"));
    };
    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   sync_radius_scale_for_state(&state, Some(&cached));
    state.active_spec = Some(cached);
    drop(state);
    request_apply();
@@ -453,9 +481,155 @@ pub fn restore_persisted() {
       .and_then(|h| load_active_spec(&h.join("themes"), &cfg))
       .and_then(|s| CachedSpec::from_spec(&s));
    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   sync_radius_scale_for_state(&state, cached.as_ref());
    state.active_spec = cached;
    drop(state);
    request_apply();
+}
+
+fn sync_radius_scale(scale: Option<f32>) -> u32 {
+   let bits = scale
+      .filter(|s| s.is_finite())
+      .map_or(f32::NAN.to_bits(), f32::to_bits);
+   RADIUS_SCALE.store(bits, Ordering::Relaxed);
+   bits
+}
+
+fn sync_radius_scale_for_state(state: &ThemeState, cached: Option<&CachedSpec>) {
+   let base_mode = state
+      .base
+      .as_ref()
+      .map_or(state.active_mode, |base| base.base_mode);
+   let scale = cached.and_then(|c| c.for_mode(base_mode).radius_scale);
+   let _ = sync_radius_scale(scale);
+}
+
+/// Lock-free active `--radius-scale` multiplier, or `None` when unset.
+#[must_use]
+pub fn radius_scale() -> Option<f32> {
+   let val = f32::from_bits(RADIUS_SCALE.load(Ordering::Relaxed));
+   val.is_finite().then_some(val)
+}
+
+/// Live semantic colors for Sunbird's own GPUI chrome (settings cards,
+/// dividers, modals, code blocks, and notification banners).
+#[derive(Clone, Copy, Debug)]
+pub struct SunbirdPalette {
+   pub bg_surface: Color,
+   pub bg_code:    Color,
+   pub border:     Color,
+   pub text:       Color,
+   pub text_muted: Color,
+   pub accent:     Color,
+   pub danger:     Color,
+   pub positive:   Color,
+}
+
+impl SunbirdPalette {
+   const DEFAULT: Self = Self {
+      bg_surface: Color::rgb(0x2B, 0x2D, 0x31),
+      bg_code:    Color::rgb(0x12, 0x14, 0x1A),
+      border:     Color::rgb(0x3F, 0x41, 0x47),
+      text:       Color::rgb(0xF2, 0xF3, 0xF5),
+      text_muted: Color::rgb(0xB5, 0xBA, 0xC1),
+      accent:     Color::rgb(0x58, 0x65, 0xF2),
+      danger:     Color::rgb(0xFF, 0x7B, 0x72),
+      positive:   Color::rgb(0x7E, 0xE7, 0x87),
+   };
+
+   const fn to_rgba_words(self) -> [u32; 8] {
+      [
+         self.bg_surface.to_rgba_u32(),
+         self.bg_code.to_rgba_u32(),
+         self.border.to_rgba_u32(),
+         self.text.to_rgba_u32(),
+         self.text_muted.to_rgba_u32(),
+         self.accent.to_rgba_u32(),
+         self.danger.to_rgba_u32(),
+         self.positive.to_rgba_u32(),
+      ]
+   }
+}
+
+impl Default for SunbirdPalette {
+   fn default() -> Self {
+      Self::DEFAULT
+   }
+}
+
+/// Converts a `phoenix_themes::Color` to GPUI's `[h, s, l, a]` tuple, with an
+/// optional alpha override.
+#[must_use]
+pub fn color_to_hsla(color: Color, alpha: Option<f32>) -> [f32; 4] {
+   let hsla = color.to_hsla();
+   [hsla.h, hsla.s, hsla.l, alpha.unwrap_or(hsla.a)]
+}
+
+/// Packs a `phoenix_themes::Color` as `0xAARRGGBB`.
+#[must_use]
+pub const fn color_to_argb(color: Color) -> u32 {
+   ((color.a as u32) << 24)
+      | ((color.r as u32) << 16)
+      | ((color.g as u32) << 8)
+      | (color.b as u32)
+}
+
+/// Lock-free read of Sunbird's cached live UI palette (zero mutex or `get_mut`
+/// work on the render thread).
+#[must_use]
+pub fn sunbird_palette() -> SunbirdPalette {
+   SunbirdPalette {
+      bg_surface: Color::from_rgba_u32(PALETTE_CACHE[0].load(Ordering::Relaxed)),
+      bg_code:    Color::from_rgba_u32(PALETTE_CACHE[1].load(Ordering::Relaxed)),
+      border:     Color::from_rgba_u32(PALETTE_CACHE[2].load(Ordering::Relaxed)),
+      text:       Color::from_rgba_u32(PALETTE_CACHE[3].load(Ordering::Relaxed)),
+      text_muted: Color::from_rgba_u32(PALETTE_CACHE[4].load(Ordering::Relaxed)),
+      accent:     Color::from_rgba_u32(PALETTE_CACHE[5].load(Ordering::Relaxed)),
+      danger:     Color::from_rgba_u32(PALETTE_CACHE[6].load(Ordering::Relaxed)),
+      positive:   Color::from_rgba_u32(PALETTE_CACHE[7].load(Ordering::Relaxed)),
+   }
+}
+
+fn store_palette_cache(pal: SunbirdPalette) {
+   for (slot, word) in PALETTE_CACHE.iter().zip(pal.to_rgba_words()) {
+      slot.store(word, Ordering::Relaxed);
+   }
+}
+
+fn refresh_palette_cache(hooks: &Hooks, colors: &AlignedBuf) {
+   let fallback = SunbirdPalette::default();
+   let mut table = colors.clone();
+   let mut pick = |names: &[&str], default: Color| -> Color {
+      for name in names {
+         if let Some(ptr) = lookup_token_mut(hooks.get_mut, &mut table, name) {
+            // SAFETY: `lookup_token_mut` verified `ptr` is 4-aligned inside `table`.
+            return Color::from_rgba_u32(unsafe { ptr.read() });
+         }
+      }
+      default
+   };
+   store_palette_cache(SunbirdPalette {
+      bg_surface: pick(
+         &["background-surface-high", "background-base-lower"],
+         fallback.bg_surface,
+      ),
+      bg_code:    pick(
+         &["background-base-lowest", "background-base-lower"],
+         fallback.bg_code,
+      ),
+      border:     pick(&["border-subtle", "border-normal"], fallback.border),
+      text:       pick(&["text-default", "text-normal"], fallback.text),
+      text_muted: pick(&["text-muted", "text-subtle"], fallback.text_muted),
+      accent:     pick(&["background-brand", "brand-500"], fallback.accent),
+      danger:     pick(
+         &["text-feedback-critical", "status-danger"],
+         fallback.danger,
+      ),
+      positive:   pick(
+         &["text-feedback-positive", "status-positive"],
+         fallback.positive,
+      ),
+   });
 }
 
 /// Currently persisted active theme filename from `themes.json`, if any.
@@ -578,15 +752,36 @@ fn flush_pending_inner(hooks: &Hooks, app: *mut c_void) {
          return;
       };
       let base_mode = base.base_mode;
-      let (colors, mode, hits) = build_active_colors(hooks, base, state.active_spec.as_ref());
+      let (colors, mode, hits, radius) =
+         build_active_colors(hooks, base, state.active_spec.as_ref());
+      let radius_bits = sync_radius_scale(radius);
+      let radius_changed = radius_bits != state.flushed_radius_bits;
       // Avoid replacing an unmodified theme on a no-op clear or a theme whose
-      // custom variables matched zero Mana tokens.
-      if hits == 0 && !state.patched_installed {
+      // custom variables matched zero Mana tokens and did not change radius.
+      if hits == 0 && !state.patched_installed && !radius_changed {
+         refresh_palette_cache(hooks, &colors);
+         state.flushed_radius_bits = radius_bits;
          state.active_colors = Some(colors);
          state.active_mode = base_mode;
          return;
       }
       let base_raw = base.raw.clone();
+      if radius_changed {
+         // A redraw request does not show new radii. `force_redraw` and GPUI's
+         // `App::refresh_windows` both repaint nothing until some primitive
+         // changes. A table one bit off in every color repaints this frame
+         // like a color edit, and the next flush installs the real one.
+         let mut nudged = colors;
+         for word in &mut nudged.words {
+            *word ^= 0x0000_0001_0000_0001;
+         }
+         let theme = make_patched_theme(hooks, &mut state, &base_raw, &nudged);
+         state.flushed_radius_bits = radius_bits;
+         state.patched_installed = true;
+         drop(state);
+         PENDING_APPLY.store(true, Ordering::Release);
+         return install_theme(hooks, app, theme);
+      }
       let patched = if hits > 0 {
          make_patched_theme(hooks, &mut state, &base_raw, &colors)
       } else {
@@ -594,19 +789,24 @@ fn flush_pending_inner(hooks: &Hooks, app: *mut c_void) {
          let orig_static = base.orig_static_colors_ptr;
          make_restored_theme(hooks, &mut state, &base_raw, &colors, orig_grad, orig_static)
       };
+      refresh_palette_cache(hooks, &colors);
+      state.flushed_radius_bits = radius_bits;
       state.active_colors = Some(colors);
       state.active_mode = mode;
       state.patched_installed = hits > 0;
       drop(state);
       patched
    };
+   install_theme(hooks, app, built);
+}
 
-   let mut buf = built;
+/// Installs `theme` as the `ManaTheme` global on the UI thread's `app`.
+fn install_theme(hooks: &Hooks, app: *mut c_void, mut theme: AlignedBuf) {
    let _guard = DetourGuard::enter();
-   // SAFETY: `app` is a live `&mut gpui::App` on the UI thread, and `buf` is a
-   // valid owned `ManaTheme` whose `Arc` refcounts were balanced by
+   // SAFETY: `app` is a live `&mut gpui::App` on the UI thread, and `theme` is
+   // a valid owned `ManaTheme` whose `Arc` refcounts were balanced by
    // `clone_base_raw`.
-   unsafe { (hooks.orig_set_global)(app, buf.as_mut_ptr()) };
+   unsafe { (hooks.orig_set_global)(app, theme.as_mut_ptr()) };
    // Discord switches themes with `set_global`, `sync_theme`, then
    // `sync_pool`. When `sync_pool` returns false Discord redraws every window,
    // which `force_redraw` does here either way.
@@ -690,6 +890,8 @@ fn handle_set_global(hooks: &Hooks, app: *mut c_void, incoming: *mut u8, consume
          let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
          state.active_colors = None;
          state.patched_installed = false;
+         store_palette_cache(SunbirdPalette::default());
+         sync_radius_scale(None);
          state.base.take()
       };
       if let Some(mut old) = old_base {
@@ -746,7 +948,9 @@ fn handle_set_global(hooks: &Hooks, app: *mut c_void, incoming: *mut u8, consume
       let base_raw = base.raw.clone();
       let orig_grad = base.orig_gradient_tag;
       let orig_static = base.orig_static_colors_ptr;
-      let (colors, mode, hits) = build_active_colors(hooks, base, state.active_spec.as_ref());
+      let (colors, mode, hits, radius) =
+         build_active_colors(hooks, base, state.active_spec.as_ref());
+      sync_radius_scale(radius);
       let patched = if hits > 0 {
          Some(make_patched_theme(hooks, &mut state, &base_raw, &colors))
       } else if own_ptr {
@@ -761,6 +965,7 @@ fn handle_set_global(hooks: &Hooks, app: *mut c_void, incoming: *mut u8, consume
       } else {
          None
       };
+      refresh_palette_cache(hooks, &colors);
       state.active_colors = Some(colors);
       state.active_mode = if hits > 0 { mode } else { base_mode };
       state.patched_installed = hits > 0;
@@ -941,16 +1146,16 @@ fn publish_color_table(state: &mut ThemeState, table: &AlignedBuf) -> *const u8 
 }
 
 /// Applies pre-resolved `spec` (if present) onto `base.colors` via Discord's
-/// `get_mut`, returning the mutated table, effective mode, and count of
-/// matched Mana tokens.
+/// `get_mut`, returning the mutated table, effective mode, count of matched
+/// Mana tokens, and resolved `--radius-scale`.
 fn build_active_colors(
    hooks: &Hooks,
    base: &BaseSnapshot,
    spec: Option<&CachedSpec>,
-) -> (AlignedBuf, ThemeMode, usize) {
+) -> (AlignedBuf, ThemeMode, usize, Option<f32>) {
    let mut table = base.colors.clone();
    let Some(spec) = spec else {
-      return (table, base.base_mode, 0);
+      return (table, base.base_mode, 0, None);
    };
    let resolved = spec.for_mode(base.base_mode);
    let mut hits = 0usize;
@@ -961,7 +1166,7 @@ fn build_active_colors(
          hits += 1;
       }
    }
-   (table, resolved.mode, hits)
+   (table, resolved.mode, hits, resolved.radius_scale)
 }
 
 fn read_u64(buf: &[u8], at: usize) -> u64 {

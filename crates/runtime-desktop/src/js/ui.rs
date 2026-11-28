@@ -1461,9 +1461,7 @@ fn notify<'js>(
       .get::<_, Option<String>>("title")?
       .unwrap_or_default();
    let body = options.get::<_, Option<String>>("body")?;
-   let accent = options
-      .get::<_, Option<f64>>("accent")?
-      .map_or(notices::ACCENT, to_argb);
+   let accent = options.get::<_, Option<f64>>("accent")?.map(to_argb);
    let duration = match options.get::<_, Option<f64>>("durationMs")? {
       Some(ms) if ms <= 0.0 => None,
       Some(ms) => Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(notices::DURATION)),

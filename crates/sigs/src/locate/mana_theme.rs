@@ -17,8 +17,15 @@ use crate::{
    index::{
       Func,
       Index,
+      Isa,
       Op,
+      Reg,
+      Step,
       Value,
+      flow::{
+         Val,
+         walk,
+      },
    },
    one,
 };
@@ -750,4 +757,495 @@ fn decode_eq_layout(
    decoded.sort_unstable();
    decoded.dedup();
    one("ManaTheme::eq layout", &decoded)
+}
+
+/// Renderer draw entrypoint and `Scene::quads` `Vec` offset for cross-platform
+/// `--radius-scale` corner-radius scaling.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneDraw {
+   /// `WgpuRenderer::draw` / `D3D` renderer `draw` (x86-64) or
+   /// `MetalRenderer::draw` (macOS arm64), taking `(renderer, scene, ...)`.
+   pub draw:    usize,
+   /// Byte offset of `Vec<Quad>` (`cap`, `ptr`, `len`) inside `gpui::Scene`.
+   pub quads:   usize,
+   /// Byte offset of `Vec<Shadow>` inside `gpui::Scene`, where the binary
+   /// names it in its scene-size panic and confirms the `Shadow` layout.
+   pub shadows: Option<usize>,
+}
+
+/// Locates the GPUI renderer's `draw(&mut self, scene: &Scene)` and
+/// `Scene::quads` across Windows, Linux, and macOS.
+pub fn scene_draw(ix: &Index<'_>) -> Found<SceneDraw> {
+   match ix.isa {
+      Isa::X86_64 { .. } => scene_draw_x64(ix),
+      Isa::Aarch64 => scene_draw_arm64(ix),
+      Isa::Thumb2 => Err("scene draw locator requires x86-64 or arm64".to_owned()),
+   }
+}
+
+fn scene_draw_x64(ix: &Index<'_>) -> Found<SceneDraw> {
+   const ANCHOR: &[u8] = b"scene too large:";
+   let text = one("scene template", &ix.text(ANCHOR))?;
+   let formatter = ix
+      .loaders(text.saturating_sub(1)..text + 1)
+      .one("scene formatter")?;
+
+   let tail = ix
+      .image
+      .read(text + ANCHOR.len(), 0x100)
+      .ok_or("scene template is unmapped")?;
+   let tail = &tail[..tail.iter().position(|&b| b == 0).unwrap_or(tail.len())];
+   // Rust's `fmt::Arguments` template encodes each `{}` placeholder as `0xC0`
+   // followed by a length-prefixed literal piece (`" quads, "`, etc.).
+   let names = tail.split(|&b| b == 0xC0).skip(1).collect::<Vec<_>>();
+   let piece_idx = |name: &[u8]| {
+      names
+         .iter()
+         .position(|piece| piece.windows(name.len()).any(|w| w == name))
+   };
+   let quad_idx = piece_idx(b"quads").ok_or("scene template has no quads")?;
+   let shadow_idx = piece_idx(b"shadows");
+
+   // Only inspect loads before the template address load inside `formatter`.
+   // When `formatter` returns a struct via hidden `sret`, `&Scene` shifts from
+   // arg 1 to arg 2 (`rdx` -> `r8` on Win64, `rsi` -> `rdx` on SysV); `draw`
+   // itself always receives `&Scene` in arg 1 (`rdx` on Win64, `rsi` on SysV).
+   let steps = formatter.steps();
+   let template_at = steps
+      .iter()
+      .find(|step| {
+         matches!(
+            step.op,
+            Op::Addr { target, .. } if target == text || target + 1 == text
+         )
+      })
+      .map_or(formatter.end, |step| step.at);
+
+   let scene_regs: &[u8] = match ix.isa {
+      Isa::X86_64 { win64: true } => &[2, 8],
+      Isa::X86_64 { win64: false } => &[6, 2],
+      _ => &[],
+   };
+   let mut matched = Vec::new();
+   for &scene_reg in scene_regs {
+      let lens = steps
+         .iter()
+         .take_while(|step| step.at < template_at)
+         .filter_map(|step| {
+            match step.op {
+               Op::Load {
+                  size: 8,
+                  base,
+                  offset,
+                  ..
+               } if base == scene_reg && offset >= 0x10 => usize::try_from(offset).ok(),
+               _ => None,
+            }
+         })
+         .collect::<Vec<_>>();
+      if lens.len() == names.len()
+         && let Some(quads) = lens[quad_idx].checked_sub(0x10)
+      {
+         matched.push((
+            quads,
+            shadow_idx.and_then(|idx| lens[idx].checked_sub(0x10)),
+         ));
+      }
+   }
+   matched.sort_unstable();
+   matched.dedup();
+   let (quads, shadows) = one("Scene::quads offset", &matched)?;
+
+   let draw = formatter.callers().one("renderer draw")?;
+   // `draw` must read `Scene::quads` `ptr` or `len` through a register or
+   // stack slot still holding its `&Scene` argument, and it or one of its
+   // direct upload callees (DirectX) must scale quad indices by
+   // `size_of::<Quad>()`.
+   let ptr_disp = isize::try_from(quads + 8).map_err(|_| "quads offset overflows")?;
+   let scene_arg = ix.isa.arg(1).ok_or("renderer draw has no scene argument")?;
+   let draw_steps = draw.steps();
+   if !reads_arg_field(ix.isa, &draw_steps, scene_arg, &[ptr_disp, ptr_disp + 8]) {
+      return Err(format!(
+         "renderer draw never reads the scene's quads at +{ptr_disp:#x}"
+      ));
+   }
+   let mut candidates = draw.calls();
+   candidates.push(draw.start);
+   let strided = candidates.into_iter().any(|addr| {
+      let Ok(func) = ix.func(addr) else {
+         return false;
+      };
+      ix.image
+         .read(func.start, func.end - func.start)
+         .is_some_and(|body| has_x64_quad_stride(body, func.start as u64))
+   });
+   if !strided {
+      return Err("renderer draw never scales quad indices by 160 bytes".to_owned());
+   }
+   verify_quad_layout(ix)?;
+   let shadows = shadows.filter(|&at| {
+      isize::try_from(at + 8)
+         .is_ok_and(|ptr| reads_arg_field(ix.isa, &draw_steps, scene_arg, &[ptr, ptr + 8]))
+         && shadow_layout_confirmed(ix)
+   });
+   Ok(SceneDraw {
+      draw: draw.start,
+      quads,
+      shadows,
+   })
+}
+
+/// Whether `steps` load `[arg + disp]` for one of `disps` through a register
+/// or stack slot still holding argument `arg` on the fall-through path.
+fn reads_arg_field(isa: Isa, steps: &[Step], arg: Reg, disps: &[isize]) -> bool {
+   let mut holders = 1u32 << arg;
+   let mut slots = Vec::<isize>::new();
+   let mut found = false;
+   walk(isa, steps, |_, step, regs| {
+      let held = |reg: Reg| holders & 1 << reg != 0;
+      let slot = |base: Reg, offset: isize| {
+         match regs[usize::from(base)] {
+            Val::Stack(at) => Some(at + offset),
+            _ => None,
+         }
+      };
+      let mut next = holders & !step.writes;
+      match step.op {
+         Op::Load {
+            reg,
+            base,
+            offset,
+            size: 8,
+         } => {
+            found |= held(base) && disps.contains(&offset);
+            if slot(base, offset).is_some_and(|at| slots.contains(&at)) {
+               next |= 1 << reg;
+            }
+         },
+         Op::Move { dst, src } if held(src) => next |= 1 << dst,
+         Op::Store {
+            value: Value::Reg(src),
+            base,
+            offset,
+            size: 8,
+         } => {
+            if let Some(at) = slot(base, offset) {
+               slots.retain(|&kept| kept != at);
+               if held(src) {
+                  slots.push(at);
+               }
+            }
+         },
+         _ => {},
+      }
+      if matches!(step.op, Op::Call(_)) {
+         next &= !isa.caller_saved();
+      }
+      holders = next;
+   });
+   found
+}
+
+/// Confirms `bounds` at `+8` and `corner_radii` at `+128` in GPUI's `Quad`.
+fn verify_quad_layout(ix: &Index<'_>) -> Found<()> {
+   let confirmed = layout_confirmed(
+      ix,
+      b"struct Quad {",
+      &[
+         "order: u32",
+         "border_style: u32",
+         "bounds: Bounds",
+         "content_mask: Bounds",
+         "background: Background",
+         "border_color: Hsla",
+         "corner_radii: Corners",
+         "border_widths: Edges",
+      ],
+      &[
+         "DrawOrder order;",
+         "enum BorderStyle border_style;",
+         "struct Bounds_ScaledPixels bounds;",
+         "struct ContentMask_ScaledPixels content_mask;",
+         "struct Background background;",
+         "struct Hsla border_color;",
+         "struct Corners_ScaledPixels corner_radii;",
+         "struct Edges_ScaledPixels border_widths;",
+      ],
+      &[
+         (b"order", 0),
+         (b"border_style", 4),
+         (b"bounds", 8),
+         (b"content_mask", 24),
+         (b"background", 40),
+         (b"border_color", 112),
+         (b"corner_radii", 128),
+         (b"border_widths", 144),
+      ],
+   );
+   if confirmed {
+      Ok(())
+   } else {
+      Err("no shader source or reflection confirms the Quad layout".to_owned())
+   }
+}
+
+/// Whether GPUI's 112-byte `Shadow` keeps `corner_radii` at `+24`,
+/// `shape_bounds` at `+72` and `shape_corner_radii` at `+88`.
+fn shadow_layout_confirmed(ix: &Index<'_>) -> bool {
+   layout_confirmed(
+      ix,
+      b"struct Shadow {",
+      &[
+         "order: u32",
+         "blur_radius: f32",
+         "bounds: Bounds",
+         "corner_radii: Corners",
+         "content_mask: Bounds",
+         "color: Hsla",
+         "shape_bounds: Bounds",
+         "shape_corner_radii: Corners",
+         "inset: u32",
+         "pad: u32",
+      ],
+      &[
+         "DrawOrder order;",
+         "ScaledPixels blur_radius;",
+         "struct Bounds_ScaledPixels bounds;",
+         "struct Corners_ScaledPixels corner_radii;",
+         "struct ContentMask_ScaledPixels content_mask;",
+         "struct Hsla color;",
+         "struct Bounds_ScaledPixels shape_bounds;",
+         "struct Corners_ScaledPixels shape_corner_radii;",
+         "PaddedBool32 inset;",
+         "uint32_t pad;",
+      ],
+      &[
+         (b"order", 0),
+         (b"blur_radius", 4),
+         (b"bounds", 8),
+         (b"corner_radii", 24),
+         (b"content_mask", 40),
+         (b"color", 56),
+         (b"shape_bounds", 72),
+         (b"shape_corner_radii", 88),
+         (b"inset", 104),
+         (b"pad", 108),
+      ],
+   )
+}
+
+/// Whether some copy of a shader struct the binary carries lists `wgsl`
+/// (Linux source), `metal` (macOS source) or `reflected` (Windows DXBC
+/// `(name, offset)` members) field for field.
+fn layout_confirmed(
+   ix: &Index<'_>,
+   header: &[u8],
+   wgsl: &[&str],
+   metal: &[&str],
+   reflected: &[(&[u8], u32)],
+) -> bool {
+   let source = ix.text(header).into_iter().any(|addr| {
+      let Some(bytes) = ix.image.read(addr, 0x400) else {
+         return false;
+      };
+      let text = String::from_utf8_lossy(bytes);
+      let Some(end) = text.find('}') else {
+         return false;
+      };
+      let fields = text[..end]
+         .lines()
+         .skip(1)
+         .map(|line| {
+            line
+               .split("//")
+               .next()
+               .unwrap_or_default()
+               .trim()
+               .trim_end_matches(',')
+         })
+         .filter(|line| !line.is_empty())
+         .collect::<Vec<_>>();
+      fields == wgsl || fields == metal
+   });
+   source || reflects_layout(ix, reflected)
+}
+
+/// Finds a struct's `$Element` member list in a DXBC `RDEF` chunk, whose
+/// 12-byte records are `(name, type, offset)` with names relative to the
+/// chunk.
+fn reflects_layout(ix: &Index<'_>, fields: &[(&[u8], u32)]) -> bool {
+   let word = |bytes: &[u8], at: usize| -> Option<u32> {
+      Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+   };
+   ix.text(b"RDEF").into_iter().any(|tag| {
+      let Some(size) = ix
+         .image
+         .read(tag + 4, 4)
+         .and_then(|bytes| word(bytes, 0))
+         .and_then(|size| usize::try_from(size).ok())
+         .filter(|&size| size <= 0x1_0000)
+      else {
+         return false;
+      };
+      let Some(chunk) = ix.image.read(tag + 8, size) else {
+         return false;
+      };
+      let name = |at: u32| -> Option<&[u8]> {
+         let rest = chunk.get(usize::try_from(at).ok()?..)?;
+         Some(&rest[..rest.iter().position(|&b| b == 0)?])
+      };
+      (0..chunk.len()).step_by(4).any(|start| {
+         fields.iter().enumerate().all(|(i, &(want, offset))| {
+            let at = start + 12 * i;
+            word(chunk, at).and_then(name) == Some(want) && word(chunk, at + 8) == Some(offset)
+         })
+      })
+   })
+}
+
+fn has_x64_quad_stride(code: &[u8], ip: u64) -> bool {
+   use iced_x86::{
+      Decoder,
+      DecoderOptions,
+      Mnemonic,
+      OpKind,
+      Register,
+   };
+
+   let mut decoder = Decoder::with_ip(64, code, ip, DecoderOptions::NONE);
+   let mut mul5_dst: Option<(Register, u8)> = None;
+   let mut shl5_dst: Option<(Register, u8)> = None;
+   while decoder.can_decode() {
+      let ins = decoder.decode();
+      match ins.mnemonic() {
+         Mnemonic::Imul
+            if ins.op_count() == 3
+               && matches!(
+                  ins.op2_kind(),
+                  OpKind::Immediate8to64 | OpKind::Immediate32to64 | OpKind::Immediate32
+               )
+               && ins.immediate(2) == 160 =>
+         {
+            return true;
+         },
+         Mnemonic::Lea
+            if ins.memory_index_scale() == 4
+               && ins.memory_base() != Register::None
+               && ins.memory_base() == ins.memory_index()
+               && ins.memory_displacement64() == 0 =>
+         {
+            if shl5_dst.is_some_and(|(reg, _)| ins.memory_base() == reg) {
+               return true;
+            }
+            mul5_dst = Some((ins.op0_register(), 3));
+            shl5_dst = None;
+            continue;
+         },
+         Mnemonic::Shl if ins.op1_kind() == OpKind::Immediate8 && ins.immediate8() == 5 => {
+            let dst = ins.op0_register();
+            if mul5_dst.is_some_and(|(reg, _)| dst == reg) {
+               return true;
+            }
+            shl5_dst = Some((dst, 3));
+            mul5_dst = None;
+            continue;
+         },
+         _ => {},
+      }
+      if let Some((reg, rem)) = mul5_dst {
+         mul5_dst = (rem > 1).then_some((reg, rem - 1));
+      }
+      if let Some((reg, rem)) = shl5_dst {
+         shl5_dst = (rem > 1).then_some((reg, rem - 1));
+      }
+   }
+   false
+}
+
+fn scene_draw_arm64(ix: &Index<'_>) -> Found<SceneDraw> {
+   let exact_loader = |needle: &[u8], label: &str| -> Found<Func<'_>> {
+      let mut funcs = Vec::new();
+      for hit in ix.text(needle) {
+         funcs.extend(ix.loaders(hit..hit + 1));
+      }
+      funcs.sort_unstable_by_key(|func| func.start);
+      funcs.dedup_by_key(|func| func.start);
+      one(label, &funcs)
+   };
+
+   let draw = exact_loader(b"draw() called on headless renderer", "MetalRenderer::draw")?;
+   let draw_scene = exact_loader(b"allocating depth texture", "MetalRenderer::draw_scene")?;
+   if !draw.calls().contains(&draw_scene.start) {
+      return Err("MetalRenderer::draw does not call draw_scene".to_owned());
+   }
+
+   let mut candidates = draw_scene.calls();
+   candidates.push(draw_scene.start);
+   candidates.sort_unstable();
+   candidates.dedup();
+
+   let mut quad_offsets = Vec::new();
+   for addr in candidates {
+      let Ok(func) = ix.func(addr) else {
+         continue;
+      };
+      if let Some(quads) = find_arm64_quads_offset(ix, func) {
+         quad_offsets.push(quads);
+      }
+   }
+   quad_offsets.sort_unstable();
+   quad_offsets.dedup();
+   let quads = one("Scene::quads offset", &quad_offsets)?;
+   verify_quad_layout(ix)?;
+   Ok(SceneDraw {
+      draw: draw.start,
+      quads,
+      shadows: None,
+   })
+}
+
+/// Decodes `Scene::quads` from `upload_scene_buffers` (or inlined `draw_scene`)
+/// using a small dataflow window around `(ldr ptr [xB, #off], ldr len [xB, #off+8])`
+/// followed by `add xL, xL, xL, lsl #2` (`* 5`) and `lsl _, xL, #5` (`* 32`,
+/// total `len * 160 == len * size_of::<Quad>()`).
+fn find_arm64_quads_offset(ix: &Index<'_>, func: Func<'_>) -> Option<usize> {
+   let bytes = ix.image.read(func.start, func.end - func.start)?;
+   let words = bytes
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .map(|&chunk| u32::from_le_bytes(chunk))
+      .collect::<Vec<_>>();
+   for (i, &ldr_ptr) in words.iter().enumerate() {
+      if (ldr_ptr & 0xFFC0_0000) != 0xF940_0000 {
+         continue;
+      }
+      let base = (ldr_ptr >> 5) & 0x1F;
+      let off_ptr = (((ldr_ptr >> 10) & 0xFFF) as usize) * 8;
+      if off_ptr < 8 {
+         continue;
+      }
+      let tail = &words[i + 1..(i + 9).min(words.len())];
+      let Some((j, &ldr_len)) = tail.iter().enumerate().find(|&(_, &w)| {
+         (w & 0xFFC0_0000) == 0xF940_0000
+            && ((w >> 5) & 0x1F) == base
+            && (((w >> 10) & 0xFFF) as usize) * 8 == off_ptr + 8
+      }) else {
+         continue;
+      };
+      let len_reg = ldr_len & 0x1F;
+      let after_len = &tail[j + 1..];
+      let want_mul5 = 0x8B00_0800 | (len_reg << 16) | (len_reg << 5) | len_reg;
+      let Some((k, _)) = after_len.iter().enumerate().find(|&(_, &w)| w == want_mul5) else {
+         continue;
+      };
+      let want_shl5_mask = 0xD37B_E800 | (len_reg << 5);
+      if after_len[k + 1..]
+         .iter()
+         .any(|&w| (w & 0xFFFF_FFE0) == want_shl5_mask)
+      {
+         return Some(off_ptr - 8);
+      }
+   }
+   None
 }

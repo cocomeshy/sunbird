@@ -1084,8 +1084,8 @@ declare namespace Phoenix {
   }
 
   /// A theme sets `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-elevated`,
-  /// `--accent-color`, `--text-normal`, `--text-muted`, `--ui-border-color`, `--radius-scale` and
-  /// `--override-nitro` in a `.theme.css` file. Unloading the plugin that applied one brings back
+  /// `--accent-color`, `--text-normal`, `--text-muted`, `--ui-border-color`, and `--radius-scale`
+  /// in a `.theme.css` or `.theme.json` file. Unloading the plugin that applied one brings back
   /// Discord's colors.
   interface Themes {
     /// Whether this Discord build's renderer could be themed.

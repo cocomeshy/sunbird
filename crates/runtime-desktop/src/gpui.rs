@@ -834,12 +834,16 @@ impl Builder {
 
    /// Rounded bordered card container matching Discord's native Settings cards.
    fn card(&self, gap_px: f32, pad_px: f32, radius_px: f32, border_alpha: f32) -> RawDiv {
+      let border = crate::mana_theme::color_to_hsla(
+         crate::mana_theme::sunbird_palette().border,
+         Some(border_alpha),
+      );
       let mut d = self.v_stack(gap_px);
       self.style_div(&mut d, |s| {
          s.lengths(&s.at.border_widths, gpui_px(1.0));
          s.lengths(&s.at.corner_radii, gpui_px(radius_px));
          s.lengths(&s.at.padding, gpui_px(pad_px));
-         s.hsla(s.at.border_color, [0.62, 0.05, 0.55, border_alpha]);
+         s.hsla(s.at.border_color, border);
       });
       d
    }
@@ -863,11 +867,15 @@ impl Builder {
 
    /// Subtle 1px horizontal divider line between sections or rows.
    fn divider(&self) -> RawDiv {
+      let border = crate::mana_theme::color_to_hsla(
+         crate::mana_theme::sunbird_palette().border,
+         Some(0.24),
+      );
       let mut d = self.raw_div();
       self.style_div(&mut d, |s| {
          s.length(s.at.border_widths[2], gpui_px(1.0));
          s.length(s.at.size[1], gpui_px(1.0));
-         s.hsla(s.at.border_color, [0.62, 0.05, 0.55, 0.16]);
+         s.hsla(s.at.border_color, border);
       });
       d
    }
@@ -1275,7 +1283,10 @@ pub fn wrap_with_accessories(
    lines: &[(String, Option<u32>)],
    tint: Option<u32>,
 ) -> bool {
-   const MUTED: [f32; 4] = [0.60, 0.08, 0.62, 0.85];
+   let muted = crate::mana_theme::color_to_hsla(
+      crate::mana_theme::sunbird_palette().text_muted,
+      Some(0.85),
+   );
 
    let Some(sym) = SYMBOLS.get() else {
       return false;
@@ -1319,7 +1330,7 @@ pub fn wrap_with_accessories(
          s.length(left, gpui_px(72.0));
       });
       for (text, color) in lines {
-         let hsla = color.map_or(MUTED, argb_to_hsla);
+         let hsla = color.map_or(muted, argb_to_hsla);
          for subline in text.lines() {
             if subline.is_empty() {
                continue;
@@ -1337,7 +1348,9 @@ pub fn wrap_with_accessories(
 }
 
 /// Muted accessory text, for lines without a color of their own.
-const ACCESSORY_MUTED: [f32; 4] = [0.60, 0.08, 0.62, 0.85];
+fn accessory_muted() -> [f32; 4] {
+   crate::mana_theme::color_to_hsla(crate::mana_theme::sunbird_palette().text_muted, Some(0.85))
+}
 
 /// One piece of an inline accessory: SVG icons when it has them and the build
 /// can draw them, else its text.
@@ -1481,7 +1494,7 @@ fn svg_icon(
 fn inline_row(b: &Builder, pieces: &[Piece], font_px: f32) -> RawDiv {
    let mut row = b.h_row(4.0, false);
    for piece in pieces {
-      let hsla = piece.color.map_or(ACCESSORY_MUTED, argb_to_hsla);
+      let hsla = piece.color.map_or_else(accessory_muted, argb_to_hsla);
       if let Some(svg) = SVG.get().filter(|_| !piece.icons.is_empty()) {
          let mut icons = b.h_row(2.0, false);
          for &(path, color) in &piece.icons {

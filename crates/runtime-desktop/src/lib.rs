@@ -44,7 +44,6 @@ mod shortcuts;
 mod sidebar;
 mod spotify;
 mod staff;
-mod theme_css;
 mod toolbar;
 
 use std::{
@@ -276,8 +275,7 @@ pub fn prepare() -> Result<(), Error> {
    #[cfg(target_arch = "x86_64")]
    feature("gpui_font", || gpui_font::install(&image));
    feature("mana_theme", || mana_theme::install(&image, &ix));
-   #[cfg(windows)]
-   feature("gpui_theme", || gpui_theme::install(&image));
+   feature("gpui_theme", || gpui_theme::install(&image, &ix));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
    let registry = phoenix_runtime::hook(&image);
    critical(
@@ -323,7 +321,6 @@ pub fn open_gate_only() -> Result<(), Error> {
 /// Starts phoenix inside Desktop Phoenix, on what [`prepare`] hooked.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    mana_theme::load_persisted(&home);
-   gpui_theme::sync_persisted_radius(&home);
    // `recovery` stages plugins for the loader it installs on every OS.
    phoenix_runtime::update::adopt_staged(&home, &home.join("plugins"));
    let prepared = PREPARED

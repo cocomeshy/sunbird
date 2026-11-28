@@ -87,34 +87,14 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       "apply",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String| {
          let dir = themes_dir();
-         if crate::mana_theme::is_supported() {
-            match crate::mana_theme::apply_file_ephemeral(&dir, &id) {
-               Ok(_) => {
-                  let _ = gpui_theme::sync_file_radius(&dir, &id);
-               },
-               Err(err) => {
-                  if gpui_theme::file_radius(&dir, &id).is_none() {
-                     return Err(Exception::throw_message(&ctx, &err));
-                  }
-                  gpui_theme::sync_file_radius(&dir, &id);
-                  let _ = crate::mana_theme::set_css("");
-               },
-            }
-         } else {
-            if id.to_ascii_lowercase().ends_with(".theme.json") {
-               return Err(Exception::throw_message(
-                  &ctx,
-                  "JSON themes require the ManaTheme engine",
-               ));
-            }
-            let path = dir.join(&id);
-            if !phoenix_themes::valid_theme_file(&id) || !path.is_file() {
-               return Err(Exception::throw_message(&ctx, &format!("no theme {id}")));
-            }
-            let css = std::fs::read_to_string(&path)
-               .map_err(|err| Exception::throw_message(&ctx, &format!("reading {id}: {err}")))?;
-            gpui_theme::set_css(&css);
+         if !crate::mana_theme::is_supported() {
+            return Err(Exception::throw_message(
+               &ctx,
+               "themes are not supported on this build",
+            ));
          }
+         crate::mana_theme::apply_file_ephemeral(&dir, &id)
+            .map_err(|err| Exception::throw_message(&ctx, &err))?;
          set_active(Some((owner.clone(), Some(id))));
          Ok(())
       })?,

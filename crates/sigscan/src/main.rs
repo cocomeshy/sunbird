@@ -488,18 +488,6 @@ fn check(
                   )
                }),
             );
-            report(
-               "scene draw",
-               desktop::scene_draw(image).map(|found| {
-                  format!(
-                     "{} quads +{:#x}, mono +{:#x}, subpixel +{:#x}",
-                     at(found.draw),
-                     found.quads,
-                     found.mono,
-                     found.subpixel
-                  )
-               }),
-            );
          }
          let json = desktop::message_json(image);
          report(

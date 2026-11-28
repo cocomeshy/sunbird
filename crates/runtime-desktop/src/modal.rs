@@ -79,19 +79,51 @@ use crate::{
 const MAX_HIGHLIGHT_LINES: usize = 600;
 const MONO_FONT: &str = "gg sans mono";
 
-// GitHub-Dark / Discord syntax palette (ARGB -> HSLA via `argb_to_hsla`).
-const COL_PLAIN: u32 = 0xFFE6_EDF3;
-const COL_KEY: u32 = 0xFF79_C0FF;
-const COL_STRING: u32 = 0xFF7E_E787;
-const COL_NUMBER: u32 = 0xFFFF_A657;
-const COL_BOOL: u32 = 0xFFD2_A8FF;
-const COL_NULL: u32 = 0xFFFF_7B72;
-const COL_PUNCT: u32 = 0xFF8B_949E;
-const COL_KEYWORD: u32 = 0xFFFF_7B72;
-const COL_COMMENT: u32 = 0xFF8B_949E;
-const COL_MUTED: u32 = 0xFF94_9BA4;
-const COL_ERROR: u32 = 0xFFFF_7B72;
-const COL_OK: u32 = 0xFF7E_E787;
+// GitHub-Dark and GitHub-Light syntax accent palettes (ARGB -> HSLA).
+struct SyntaxColors {
+   key:     u32,
+   string:  u32,
+   number:  u32,
+   bool_:   u32,
+   null:    u32,
+   punct:   u32,
+   keyword: u32,
+   comment: u32,
+}
+
+const SYNTAX_DARK: SyntaxColors = SyntaxColors {
+   key:     0xFF79_C0FF,
+   string:  0xFF7E_E787,
+   number:  0xFFFF_A657,
+   bool_:   0xFFD2_A8FF,
+   null:    0xFFFF_7B72,
+   punct:   0xFF8B_949E,
+   keyword: 0xFFFF_7B72,
+   comment: 0xFF8B_949E,
+};
+
+const SYNTAX_LIGHT: SyntaxColors = SyntaxColors {
+   key:     0xFF05_50AE,
+   string:  0xFF11_6329,
+   number:  0xFF95_3800,
+   bool_:   0xFF66_39BA,
+   null:    0xFFCF_222E,
+   punct:   0xFF57_606A,
+   keyword: 0xFFCF_222E,
+   comment: 0xFF57_606A,
+};
+
+fn col_muted() -> u32 {
+   crate::mana_theme::color_to_argb(crate::mana_theme::sunbird_palette().text_muted)
+}
+
+fn col_error() -> u32 {
+   crate::mana_theme::color_to_argb(crate::mana_theme::sunbird_palette().danger)
+}
+
+fn col_ok() -> u32 {
+   crate::mana_theme::color_to_argb(crate::mana_theme::sunbird_palette().positive)
+}
 
 // ---------------------------------------------------------------------------
 // Public Modal Specs
@@ -207,8 +239,8 @@ impl FieldStatus {
    fn line(&self) -> Option<(&str, u32)> {
       match self {
          Self::Idle => None,
-         Self::Working(msg) => Some((msg, COL_OK)),
-         Self::Failed(msg) => Some((msg, COL_ERROR)),
+         Self::Working(msg) => Some((msg, col_ok())),
+         Self::Failed(msg) => Some((msg, col_error())),
       }
    }
 }
@@ -2407,16 +2439,25 @@ fn build_code_box(
    monospace: bool,
    do_highlight: bool,
 ) -> Option<RawDiv> {
+   let pal = crate::mana_theme::sunbird_palette();
+   let plain = crate::mana_theme::color_to_argb(pal.text);
+   let syntax = if pal.bg_code.relative_luminance() > 0.35 {
+      &SYNTAX_LIGHT
+   } else {
+      &SYNTAX_DARK
+   };
    let mut box_div = gpui::v_stack(1.0)?;
    box_div = div_with_id(msym, box_div, box_id);
    gpui::style_div(&mut box_div, |s| {
-      // Dark Discord code-block background + border + horizontal scroll.
-      s.solid_background([0.62, 0.10, 0.08, 1.0]);
+      s.solid_background(crate::mana_theme::color_to_hsla(pal.bg_code, Some(1.0)));
       s.lengths(&s.at.border_widths, gpui_px(1.0));
       s.lengths(&s.at.corner_radii, gpui_px(8.0));
       s.lengths(&s.at.padding, gpui_px(12.0));
       s.length(s.at.size[0], W_FULL);
-      s.hsla(s.at.border_color, [0.62, 0.08, 0.45, 0.25]);
+      s.hsla(
+         s.at.border_color,
+         crate::mana_theme::color_to_hsla(pal.border, Some(0.35)),
+      );
       s.set(s.at.overflow_x, OVERFLOW_SCROLL);
       if monospace {
          set_mono_font(s, 12.5, 18.0);
@@ -2427,7 +2468,7 @@ fn build_code_box(
    for (idx, line) in text.split('\n').enumerate() {
       let line = line.strip_suffix('\r').unwrap_or(line);
       if line.is_empty() {
-         if let Some(sp) = mono_span(" ", COL_PLAIN) {
+         if let Some(sp) = mono_span(" ", plain) {
             box_div = gpui::push_div(box_div, sp);
          }
          continue;
@@ -2443,24 +2484,24 @@ fn build_code_box(
          let spans = if is_json {
             coalesce(highlight::json(line).into_iter().map(|(kind, tok)| {
                let color = match kind {
-                  JsonKind::Key => COL_KEY,
-                  JsonKind::String => COL_STRING,
-                  JsonKind::Number => COL_NUMBER,
-                  JsonKind::Bool => COL_BOOL,
-                  JsonKind::Null => COL_NULL,
-                  JsonKind::Punctuation => COL_PUNCT,
-                  JsonKind::Plain => COL_PLAIN,
+                  JsonKind::Key => syntax.key,
+                  JsonKind::String => syntax.string,
+                  JsonKind::Number => syntax.number,
+                  JsonKind::Bool => syntax.bool_,
+                  JsonKind::Null => syntax.null,
+                  JsonKind::Punctuation => syntax.punct,
+                  JsonKind::Plain => plain,
                };
                (color, tok)
             }))
          } else {
             coalesce(highlight::js(line).into_iter().map(|(kind, tok)| {
                let color = match kind {
-                  Kind::Keyword => COL_KEYWORD,
-                  Kind::String => COL_STRING,
-                  Kind::Number => COL_NUMBER,
-                  Kind::Comment => COL_COMMENT,
-                  Kind::Plain => COL_PLAIN,
+                  Kind::Keyword => syntax.keyword,
+                  Kind::String => syntax.string,
+                  Kind::Number => syntax.number,
+                  Kind::Comment => syntax.comment,
+                  Kind::Plain => plain,
                };
                (color, tok)
             }))
@@ -2472,10 +2513,10 @@ fn build_code_box(
          }
          box_div = gpui::push_div(box_div, row);
       } else if monospace {
-         if let Some(span) = mono_span(line, COL_PLAIN) {
+         if let Some(span) = mono_span(line, plain) {
             box_div = gpui::push_div(box_div, span);
          }
-      } else if let Some(div) = plain_text_div(line, Some(COL_PLAIN), 13.0) {
+      } else if let Some(div) = plain_text_div(line, Some(plain), 13.0) {
          box_div = gpui::push_div(box_div, div);
       }
    }
@@ -2483,6 +2524,7 @@ fn build_code_box(
 }
 
 fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> {
+   let muted = col_muted();
    let mut body = gpui::v_stack(14.0)?;
    gpui::style_div(&mut body, |s| s.length(s.at.size[0], W_FULL));
    for (sec_idx, section) in spec.sections.iter().enumerate() {
@@ -2491,7 +2533,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(8.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(muted), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -2520,7 +2562,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(6.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(muted), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -2540,7 +2582,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(6.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(muted), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -2667,7 +2709,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                }
             } else if let Some(msg) = plain_text_div(
                "Native TextArea could not be resolved on this Discord build.",
-               Some(COL_ERROR),
+               Some(col_error()),
                13.5,
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
@@ -2757,7 +2799,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                }
             } else if let Some(msg) = plain_text_div(
                "Native TextInput could not be resolved on this Discord build.",
-               Some(COL_ERROR),
+               Some(col_error()),
                13.5,
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
