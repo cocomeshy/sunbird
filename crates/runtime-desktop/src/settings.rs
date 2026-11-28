@@ -554,6 +554,12 @@ unsafe extern "C" fn section_detour(
    window: *mut c_void,
    cx: *mut c_void,
 ) -> *mut RawAnyElement {
+   if !cx.is_null() {
+      // SAFETY: `[cx]` is `*mut gpui::App` inside `Context<T>`.
+      let app = unsafe { *(cx.cast::<*mut c_void>()) };
+      // SAFETY: `app` is null or a live `&mut gpui::App` on the UI thread.
+      unsafe { crate::mana_theme::flush_pending(app) };
+   }
    if !host_state.is_null() && !sret.is_null() {
       let offset = PAGE_OFFSET.load(Ordering::Acquire);
       // SAFETY: `host_state` is Discord's live `&mut HostState` for this render

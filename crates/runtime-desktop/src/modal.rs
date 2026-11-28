@@ -2138,6 +2138,12 @@ unsafe extern "C" fn overlay_render_detour(
    let Some(orig) = ORIG_OVERLAY_RENDER.get().copied() else {
       return sret;
    };
+   if !cx.is_null() {
+      // SAFETY: `[cx]` is `*mut gpui::App` inside `Context<Workspace>`.
+      let app = unsafe { *(cx.cast::<*mut c_void>()) };
+      // SAFETY: `app` is null or a live `&mut gpui::App` on the UI thread.
+      unsafe { crate::mana_theme::flush_pending(app) };
+   }
    // SAFETY: always render Discord's own overlay stack first.
    let out = unsafe { orig(sret, workspace, arg3, window, cx) };
    WINDOW_SEEN.store(true, Ordering::Release);

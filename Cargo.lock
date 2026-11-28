@@ -676,6 +676,7 @@ dependencies = [
  "phoenix-hook",
  "phoenix-runtime",
  "phoenix-sigs",
+ "phoenix-themes",
  "phoenix-ui-desktop",
  "rquickjs",
  "serde",

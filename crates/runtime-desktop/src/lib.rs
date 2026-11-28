@@ -28,6 +28,7 @@ mod headers;
 mod health;
 mod icons;
 mod js;
+pub mod mana_theme;
 mod members;
 mod message;
 mod modal;
@@ -274,6 +275,7 @@ pub fn prepare() -> Result<(), Error> {
    feature("call_idle_afk", || call_idle::install_guild_afk(&image, &ix));
    #[cfg(target_arch = "x86_64")]
    feature("gpui_font", || gpui_font::install(&image));
+   feature("mana_theme", || mana_theme::install(&image, &ix));
    #[cfg(windows)]
    feature("gpui_theme", || gpui_theme::install(&image));
    feature("os_redraw", || <os::Os as os::DesktopOs>::install(&image));
@@ -320,6 +322,8 @@ pub fn open_gate_only() -> Result<(), Error> {
 
 /// Starts phoenix inside Desktop Phoenix, on what [`prepare`] hooked.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
+   mana_theme::load_persisted(&home);
+   gpui_theme::sync_persisted_radius(&home);
    // `recovery` stages plugins for the loader it installs on every OS.
    phoenix_runtime::update::adopt_staged(&home, &home.join("plugins"));
    let prepared = PREPARED
@@ -643,12 +647,23 @@ impl Platform for Desktop {
                modal_rendered: modal::rendered(),
             }))
          },
+         ("GET", "/themes/tokens") => {
+            let names = remote::query_param(&request.query, "names").and_then(|raw| {
+               let list: Vec<String> = raw
+                  .split(',')
+                  .map(|part| part.trim().to_owned())
+                  .filter(|part| !part.is_empty())
+                  .collect();
+               (!list.is_empty()).then_some(list)
+            });
+            Some(remote::ok_json(&mana_theme::debug_tokens(names.as_deref())))
+         },
          _ => None,
       }
    }
 
    fn routes(&self) -> &'static str {
-      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health"
+      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens"
    }
 }
 

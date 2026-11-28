@@ -29,6 +29,7 @@ pub struct Palette {
 #[derive(Clone, Debug)]
 pub struct Theme {
    pub active:         bool,
+   #[cfg(test)]
    pub name:           String,
    pub bg:             Option<Palette>,
    pub accent:         Option<Hsla>,
@@ -43,6 +44,7 @@ impl Default for Theme {
    fn default() -> Self {
       Self {
          active:         false,
+         #[cfg(test)]
          name:           String::new(),
          bg:             None,
          accent:         None,
@@ -273,7 +275,10 @@ fn css_vars(clean: &str) -> HashMap<String, String> {
 
 #[must_use]
 pub fn parse_theme_css(css: &str) -> Theme {
+   #[cfg(test)]
    let (clean, name) = strip_comments(css);
+   #[cfg(not(test))]
+   let (clean, _) = strip_comments(css);
    let vars = css_vars(&clean);
    let color = |keys: &[&str]| keys.iter().find_map(|k| parse_css_color(vars.get(*k)?));
    let float = |keys: &[&str], range: std::ops::RangeInclusive<f32>| {
@@ -337,6 +342,7 @@ pub fn parse_theme_css(css: &str) -> Theme {
 
    let defaults = Theme::default();
    let mut t = Theme {
+      #[cfg(test)]
       name,
       bg,
       accent: color(&[

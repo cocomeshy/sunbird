@@ -54,18 +54,28 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       Function::new(
          ctx.clone(),
          |ctx: Ctx<'js>| -> rquickjs::Result<Array<'js>> {
-            let active = ACTIVE
+            let active = match ACTIVE
                .lock()
                .unwrap_or_else(PoisonError::into_inner)
                .as_ref()
-               .and_then(|(_, file)| file.clone());
+            {
+               Some((_, file)) => file.clone(),
+               None => crate::mana_theme::active_file(),
+            };
             let arr = Array::new(ctx.clone())?;
             for (i, theme) in gpui_theme::list(&themes_dir()).into_iter().enumerate() {
                let item = Object::new(ctx.clone())?;
                item.set("active", active.as_deref() == Some(theme.file.as_str()))?;
                item.set("id", theme.file)?;
                item.set("name", theme.name)?;
-               item.set("authors", Array::new(ctx.clone())?)?;
+               if let Some(description) = theme.description {
+                  item.set("description", description)?;
+               }
+               let authors = Array::new(ctx.clone())?;
+               if let Some(author) = theme.author {
+                  authors.set(0, author)?;
+               }
+               item.set("authors", authors)?;
                arr.set(i, item)?;
             }
             Ok(arr)
@@ -76,14 +86,35 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
    themes.set(
       "apply",
       Function::new(ctx.clone(), move |ctx: Ctx<'js>, id: String| {
-         // Only files inside the themes folder.
-         let path = themes_dir().join(&id);
-         if id.contains(['/', '\\', ':']) || !path.is_file() {
-            return Err(Exception::throw_message(&ctx, &format!("no theme {id}")));
+         let dir = themes_dir();
+         if crate::mana_theme::is_supported() {
+            match crate::mana_theme::apply_file_ephemeral(&dir, &id) {
+               Ok(_) => {
+                  let _ = gpui_theme::sync_file_radius(&dir, &id);
+               },
+               Err(err) => {
+                  if gpui_theme::file_radius(&dir, &id).is_none() {
+                     return Err(Exception::throw_message(&ctx, &err));
+                  }
+                  gpui_theme::sync_file_radius(&dir, &id);
+                  let _ = crate::mana_theme::set_css("");
+               },
+            }
+         } else {
+            if id.to_ascii_lowercase().ends_with(".theme.json") {
+               return Err(Exception::throw_message(
+                  &ctx,
+                  "JSON themes require the ManaTheme engine",
+               ));
+            }
+            let path = dir.join(&id);
+            if !phoenix_themes::valid_theme_file(&id) || !path.is_file() {
+               return Err(Exception::throw_message(&ctx, &format!("no theme {id}")));
+            }
+            let css = std::fs::read_to_string(&path)
+               .map_err(|err| Exception::throw_message(&ctx, &format!("reading {id}: {err}")))?;
+            gpui_theme::set_css(&css);
          }
-         let css = std::fs::read_to_string(&path)
-            .map_err(|err| Exception::throw_message(&ctx, &format!("reading {id}: {err}")))?;
-         gpui_theme::set_css(&css);
          set_active(Some((owner.clone(), Some(id))));
          Ok(())
       })?,

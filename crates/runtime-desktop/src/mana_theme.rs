@@ -1,0 +1,985 @@
+//! Cross-platform `ManaTheme` semantic theming engine for Desktop Phoenix.
+//!
+//! Hooks `gpui::App::set_global::<ManaTheme>` on macOS, Windows, and Linux,
+//! self-tests Discord's `SemanticColors::get_mut` against a scratch table
+//! sized from the binary, snapshots Discord's unmodified `ManaTheme` with
+//! balanced `Arc` refcounts, mutates an 8-byte-aligned `SemanticColors` table
+//! from pre-resolved palettes into a fixed rotating ring of owned buffers, and
+//! installs it via tag 0 (static reference) so GPUI's `PartialEq` invalidates
+//! cached views with zero atomic refcount overhead or unbounded heap leaks.
+
+use std::{
+   cell::Cell,
+   collections::BTreeMap,
+   ffi::c_void,
+   path::{
+      Path,
+      PathBuf,
+   },
+   sync::{
+      LazyLock,
+      Mutex,
+      OnceLock,
+      PoisonError,
+      atomic::{
+         AtomicBool,
+         AtomicUsize,
+         Ordering,
+      },
+   },
+};
+
+use phoenix_hook::image::Image;
+use phoenix_sigs::{
+   index::Index,
+   locate::mana_theme::{
+      self,
+      ManaThemeLayout,
+   },
+};
+use phoenix_themes::{
+   Color,
+   ResolvedPalette,
+   ThemeConfig,
+   ThemeMode,
+   ThemeSpec,
+   load_active_spec,
+   load_config,
+   read_contained_theme,
+};
+use serde::Serialize;
+
+/// Number of rotating owned `SemanticColors` buffers kept alive for tag-0
+/// publication. Consecutive `set_global` calls always receive distinct
+/// pointers so GPUI's `PartialEq` invalidates cached views while total memory
+/// stays strictly bounded.
+const COLOR_RING_SLOTS: usize = 8;
+
+type SetGlobalFn = unsafe extern "C" fn(*mut c_void, *mut u8);
+type SyncPoolFn = unsafe extern "C" fn(*const c_void, *mut c_void) -> bool;
+type SyncThemeFn = unsafe extern "C" fn(*mut c_void);
+type DropInPlaceFn = unsafe extern "C" fn(*mut u8);
+type GetMutFn = unsafe extern "C" fn(*mut u8, *const u8, usize) -> *mut u32;
+
+struct Hooks {
+   orig_set_global: SetGlobalFn,
+   sync_pool:       SyncPoolFn,
+   sync_theme:      SyncThemeFn,
+   drop_in_place:   DropInPlaceFn,
+   get_mut:         GetMutFn,
+   size:            usize,
+   colors_size:     usize,
+   layout:          ManaThemeLayout,
+   /// Harmless static placeholder installed into `BaseSnapshot`'s tag-0 slot
+   /// so snapshotting never allocates or leaks a color table on Discord theme
+   /// switches.
+   dummy_colors:    Box<[u64]>,
+}
+
+impl Hooks {
+   fn dummy_colors_ptr(&self) -> usize {
+      self.dummy_colors.as_ptr().cast::<u8>() as usize
+   }
+}
+
+/// Published atomically right after `hook_entry` so an early detour can always
+/// forward `incoming` even before `HOOKS` is populated.
+static ORIG_SET_GLOBAL: AtomicUsize = AtomicUsize::new(0);
+static HOOKS: OnceLock<Hooks> = OnceLock::new();
+static PENDING_APPLY: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+   static IN_DETOUR: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that restores `IN_DETOUR` even if an observer or drop unwinds.
+struct DetourGuard(bool);
+
+impl DetourGuard {
+   fn enter() -> Self {
+      let prev = IN_DETOUR.with(|flag| flag.replace(true));
+      Self(prev)
+   }
+}
+
+impl Drop for DetourGuard {
+   fn drop(&mut self) {
+      IN_DETOUR.with(|flag| flag.set(self.0));
+   }
+}
+
+/// 8-byte-aligned owned byte buffer for dynamically sized `ManaTheme` and
+/// `SemanticColors` copies.
+#[derive(Clone)]
+struct AlignedBuf {
+   words: Vec<u64>,
+   len:   usize,
+}
+
+impl AlignedBuf {
+   fn filled(len: usize, fill: u8) -> Self {
+      let word = u64::from_ne_bytes([fill; 8]);
+      Self {
+         words: vec![word; len.div_ceil(8)],
+         len,
+      }
+   }
+
+   fn from_bytes(bytes: &[u8]) -> Self {
+      let mut words = vec![0u64; bytes.len().div_ceil(8)];
+      // SAFETY: `words` has at least `bytes.len()` writable bytes.
+      unsafe {
+         std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast::<u8>(), bytes.len());
+      }
+      Self {
+         words,
+         len: bytes.len(),
+      }
+   }
+
+   const fn len(&self) -> usize {
+      self.len
+   }
+
+   const fn as_bytes(&self) -> &[u8] {
+      // SAFETY: `self.len <= self.words.len() * 8`.
+      unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
+   }
+
+   const fn as_bytes_mut(&mut self) -> &mut [u8] {
+      // SAFETY: `self.len <= self.words.len() * 8`.
+      unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<u8>(), self.len) }
+   }
+
+   const fn as_mut_ptr(&mut self) -> *mut u8 {
+      self.words.as_mut_ptr().cast::<u8>()
+   }
+}
+
+/// Pre-resolved dark and light palettes so the UI-thread detours never parse
+/// CSS or expand `var()` chains under the state lock.
+struct CachedSpec {
+   dark:  ResolvedPalette,
+   light: ResolvedPalette,
+}
+
+impl CachedSpec {
+   fn from_spec(spec: &ThemeSpec) -> Option<Self> {
+      let dark = spec.resolve(ThemeMode::Dark);
+      let light = spec.resolve(ThemeMode::Light);
+      (!dark.tokens.is_empty() || !light.tokens.is_empty()).then_some(Self { dark, light })
+   }
+
+   const fn for_mode(&self, base_mode: ThemeMode) -> &ResolvedPalette {
+      match base_mode {
+         ThemeMode::Dark => &self.dark,
+         ThemeMode::Light => &self.light,
+      }
+   }
+}
+
+struct BaseSnapshot {
+   /// Unmodified `ManaTheme` bytes with `colors_ref` pointed at
+   /// `dummy_colors`, `pre_filter` preserved intact (with its `Arc` refcount
+   /// balanced), and `gradient_tag` cleared to `gradient_none`.
+   raw:                    AlignedBuf,
+   /// Unmodified `SemanticColors` table.
+   colors:                 AlignedBuf,
+   /// Detected dark/light mode of Discord's base theme.
+   base_mode:              ThemeMode,
+   /// Discord's original `Option<GradientTheme>` discriminant byte so clearing
+   /// a Sunbird theme restores Nitro gradients cleanly.
+   orig_gradient_tag:      u8,
+   /// Discord's original static (`tag == 0`) `SemanticColors` pointer when the
+   /// base theme was static, restored on clear so Discord's own pointer is back.
+   orig_static_colors_ptr: Option<usize>,
+}
+
+struct ThemeState {
+   home:              Option<PathBuf>,
+   config:            ThemeConfig,
+   active_spec:       Option<CachedSpec>,
+   base:              Option<BaseSnapshot>,
+   /// Whether the currently installed `ManaTheme` global is a Sunbird-patched
+   /// copy (so a no-op clear does not overwrite an unmodified Nitro gradient).
+   patched_installed: bool,
+   /// Most recently installed `SemanticColors` bytes (themed or base), for
+   /// live token inspection and Sunbird UI chrome.
+   active_colors:     Option<AlignedBuf>,
+   active_mode:       ThemeMode,
+   /// Fixed rotating ring of 8-byte-aligned owned `SemanticColors` buffers
+   /// handed to Discord via tag 0. Slots are allocated once and never move.
+   color_ring:        Vec<Box<[u64]>>,
+   ring_next:         usize,
+}
+
+impl Default for ThemeState {
+   fn default() -> Self {
+      Self {
+         home:              None,
+         config:            ThemeConfig::default(),
+         active_spec:       None,
+         base:              None,
+         patched_installed: false,
+         active_colors:     None,
+         active_mode:       ThemeMode::Dark,
+         color_ring:        Vec::new(),
+         ring_next:         0,
+      }
+   }
+}
+
+static STATE: LazyLock<Mutex<ThemeState>> = LazyLock::new(Mutex::default);
+
+/// Typed JSON payload returned by `/themes/tokens`.
+#[derive(Serialize)]
+pub struct DebugTokens {
+   pub supported: bool,
+   pub mode:      &'static str,
+   pub active:    Option<String>,
+   pub tokens:    BTreeMap<String, String>,
+}
+
+/// Bounds- and alignment-checks every pointer returned by Discord's `get_mut`
+/// against `table` before any caller may read or write through it.
+fn lookup_token_mut(get_mut: GetMutFn, table: &mut AlignedBuf, name: &str) -> Option<*mut u32> {
+   let len = table.len();
+   let base = table.as_mut_ptr() as usize;
+   // SAFETY: `table` is an 8-byte-aligned `SemanticColors` buffer sized from
+   // the binary and `get_mut` was self-tested during `install()`.
+   let ptr = unsafe { get_mut(table.as_mut_ptr(), name.as_ptr(), name.len()) };
+   let addr = ptr as usize;
+   let offset = addr.checked_sub(base)?;
+   if offset + 4 <= len && offset.is_multiple_of(4) {
+      Some(ptr)
+   } else {
+      None
+   }
+}
+
+/// Self-tests the located `get_mut` against a sentinel scratch table before
+/// installing any hook: a known token must return a 4-aligned pointer inside
+/// the decoded `colors_size` table, an unknown token must return null, and a
+/// sentinel write must touch only that 4-byte slot.
+fn validate_get_mut(get_mut: GetMutFn, colors_size: usize) -> bool {
+   const FILL: u8 = 0x5a;
+   const SENTINEL: u32 = 0xdead_beef;
+   let mut table = AlignedBuf::filled(colors_size, FILL);
+   let Some(slot) = lookup_token_mut(get_mut, &mut table, "background-base-low") else {
+      return false;
+   };
+   let offset = slot as usize - table.as_mut_ptr() as usize;
+   if lookup_token_mut(get_mut, &mut table, "__sunbird_nonexistent_token__").is_some() {
+      return false;
+   }
+   // SAFETY: `lookup_token_mut` verified `slot` is 4-aligned and inside `table`.
+   unsafe { slot.write(SENTINEL) };
+   // SAFETY: same verified slot.
+   if unsafe { slot.read() } != SENTINEL {
+      return false;
+   }
+   let bytes = table.as_bytes();
+   let before_ok = bytes[..offset].iter().all(|&b| b == FILL);
+   let after_ok = bytes[offset + 4..].iter().all(|&b| b == FILL);
+   before_ok && after_ok
+}
+
+const fn layout_within_bounds(size: usize, colors_size: usize, layout: ManaThemeLayout) -> bool {
+   size >= 0x30
+      && colors_size >= 0x400
+      && colors_size.is_multiple_of(8)
+      && layout.theme_ref + 16 <= size
+      && layout.colors_ref + 16 <= size
+      && layout.pre_filter + 16 <= size
+      && layout.base_theme < size
+      && layout.gradient_tag < size
+}
+
+/// Locates, self-tests, and hooks `App::set_global::<ManaTheme>` during
+/// `prepare()`.
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
+   let found = match mana_theme::mana_theme(ix) {
+      Ok(found) => found,
+      Err(err) => {
+         log::warn!("mana theme: {err}, semantic themes disabled");
+         return;
+      },
+   };
+   if !layout_within_bounds(found.size, found.colors_size, found.layout) {
+      log::warn!(
+         "mana theme: decoded layout out of bounds (size {:#x}, colors {:#x}, {:?}), semantic \
+          themes disabled",
+         found.size,
+         found.colors_size,
+         found.layout
+      );
+      return;
+   }
+   // SAFETY: `mana_theme` verified `sync_pool`, `sync_theme`, `drop_in_place`,
+   // and `get_mut` are code entrypoints; `validate_get_mut` verifies `get_mut`'s ABI.
+   let (sync_pool, sync_theme, drop_in_place, get_mut): (
+      SyncPoolFn,
+      SyncThemeFn,
+      DropInPlaceFn,
+      GetMutFn,
+   ) = unsafe {
+      (
+         std::mem::transmute::<usize, SyncPoolFn>(found.sync_pool),
+         std::mem::transmute::<usize, SyncThemeFn>(found.sync_theme),
+         std::mem::transmute::<usize, DropInPlaceFn>(found.drop_in_place),
+         std::mem::transmute::<usize, GetMutFn>(found.get_mut),
+      )
+   };
+   let self_test_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      validate_get_mut(get_mut, found.colors_size)
+   }))
+   .unwrap_or(false);
+   if !self_test_ok {
+      log::warn!(
+         "mana theme: get_mut @ {:#x} failed scratch-table self-test, semantic themes disabled",
+         found.get_mut
+      );
+      return;
+   }
+   // SAFETY: runs during `prepare` before Discord's threads reach `set_global`,
+   // and `set_global_detour` matches `App::set_global::<ManaTheme>`.
+   let trampoline = match unsafe {
+      image.hook_entry(found.set_global, set_global_detour as *const () as usize)
+   } {
+      Ok(trampoline) => trampoline,
+      Err(err) => {
+         log::warn!("mana theme set_global: {err}");
+         return;
+      },
+   };
+   ORIG_SET_GLOBAL.store(trampoline, Ordering::Release);
+   // SAFETY: `trampoline` runs `set_global`'s displaced instructions.
+   let orig_set_global = unsafe { std::mem::transmute::<usize, SetGlobalFn>(trampoline) };
+   let dummy_colors = vec![0u64; found.colors_size.div_ceil(8)].into_boxed_slice();
+   let _ = HOOKS.set(Hooks {
+      orig_set_global,
+      sync_pool,
+      sync_theme,
+      drop_in_place,
+      get_mut,
+      size: found.size,
+      colors_size: found.colors_size,
+      layout: found.layout,
+      dummy_colors,
+   });
+   log::info!(
+      "mana theme: hooked set_global @ {:#x} (size {:#x}, colors {:#x}, get_mut {:#x})",
+      found.set_global,
+      found.size,
+      found.colors_size,
+      found.get_mut
+   );
+}
+
+/// Whether the cross-platform `ManaTheme` semantic engine is active and has at
+/// least one live UI-thread drain site.
+#[must_use]
+pub fn is_supported() -> bool {
+   HOOKS.get().is_some() && (crate::modal::hooked() || crate::settings::hooked())
+}
+
+/// Loads `<home>/themes.json` and the active theme file on boot so themes
+/// apply on frame 1 when Discord initializes `ManaTheme`.
+pub fn load_persisted(home: &Path) {
+   let config_path = home.join("themes.json");
+   let themes_dir = home.join("themes");
+   let config = load_config(&config_path);
+   let loaded = load_active_spec(&themes_dir, &config);
+   let cached = loaded.as_ref().and_then(CachedSpec::from_spec);
+   if loaded.is_some() && cached.is_none() {
+      log::warn!(
+         "mana theme: saved theme {:?} sets no supported color tokens, ignoring",
+         config.active
+      );
+   }
+   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   state.home = Some(home.to_owned());
+   state.config = config;
+   state.active_spec = cached;
+   let should_flush = state.base.is_some();
+   drop(state);
+   if should_flush {
+      request_apply();
+   }
+}
+
+/// Reads and parses a theme file contained within `themes_dir` (rejecting
+/// traversal and symlinks escaping `themes_dir`).
+fn read_theme_file(themes_dir: &Path, file: &str) -> Result<ThemeSpec, String> {
+   let raw = read_contained_theme(themes_dir, file)?;
+   ThemeSpec::parse_file(file, &raw)
+}
+
+/// Applies raw `.theme.css` text live without changing persisted `themes.json`
+/// (used by `phoenix.themes.setCss`).
+pub fn set_css(css: &str) -> bool {
+   let cached = CachedSpec::from_spec(&ThemeSpec::parse_css(css));
+   let active = cached.is_some();
+   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   state.active_spec = cached;
+   drop(state);
+   request_apply();
+   active
+}
+
+/// Applies a theme file from `themes_dir` live without mutating persisted
+/// `themes.json` (used by JS `phoenix.themes.apply`).
+pub fn apply_file_ephemeral(themes_dir: &Path, file: &str) -> Result<bool, String> {
+   let parsed = read_theme_file(themes_dir, file)?;
+   let Some(cached) = CachedSpec::from_spec(&parsed) else {
+      return Err(format!("theme {file} sets no supported color tokens"));
+   };
+   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   state.active_spec = Some(cached);
+   drop(state);
+   request_apply();
+   Ok(true)
+}
+
+/// Drops a plugin's ephemeral override and restores whatever `themes.json` has
+/// active (or Discord's unmodified palette if none).
+pub fn restore_persisted() {
+   let (home, cfg) = {
+      let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      (state.home.clone(), state.config.clone())
+   };
+   let cached = home
+      .as_ref()
+      .and_then(|h| load_active_spec(&h.join("themes"), &cfg))
+      .and_then(|s| CachedSpec::from_spec(&s));
+   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   state.active_spec = cached;
+   drop(state);
+   request_apply();
+}
+
+/// Currently persisted active theme filename from `themes.json`, if any.
+#[must_use]
+pub fn active_file() -> Option<String> {
+   STATE
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .config
+      .active
+      .clone()
+}
+
+/// Reads a single live semantic token color by its Mana name (e.g.
+/// `"background-base-low"`).
+#[must_use]
+pub fn read_token(name: &str) -> Option<Color> {
+   let hooks = HOOKS.get()?;
+   let mut table = STATE
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .active_colors
+      .clone()?;
+   let ptr = lookup_token_mut(hooks.get_mut, &mut table, name)?;
+   // SAFETY: `lookup_token_mut` verified `ptr` is 4-aligned and inside `table`.
+   Some(Color::from_rgba_u32(unsafe { ptr.read() }))
+}
+
+/// Snapshot of live theme status and key resolved tokens for `/themes/tokens`.
+#[must_use]
+pub fn debug_tokens(requested: Option<&[String]>) -> DebugTokens {
+   const DEFAULT_TOKENS: &[&str] = &[
+      "background-base-lowest",
+      "background-base-lower",
+      "background-base-low",
+      "background-surface-high",
+      "background-surface-higher",
+      "background-brand",
+      "text-default",
+      "text-strong",
+      "text-muted",
+      "text-brand",
+      "border-subtle",
+      "border-normal",
+      "button-filled-brand-background",
+      "button-filled-brand-text",
+      "chat-input-container-background",
+   ];
+
+   let (mode, active) = {
+      let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      (
+         match state.active_mode {
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+         },
+         state.config.active.clone(),
+      )
+   };
+
+   let mut tokens = BTreeMap::new();
+   if let Some(names) = requested.filter(|slice| !slice.is_empty()) {
+      for name in names {
+         if let Some(color) = read_token(name) {
+            tokens.insert(name.clone(), color.to_hex());
+         }
+      }
+   } else {
+      for &name in DEFAULT_TOKENS {
+         if let Some(color) = read_token(name) {
+            tokens.insert(name.to_owned(), color.to_hex());
+         }
+      }
+   }
+
+   DebugTokens {
+      supported: is_supported(),
+      mode,
+      active,
+      tokens,
+   }
+}
+
+fn request_apply() {
+   if HOOKS.get().is_some() {
+      PENDING_APPLY.store(true, Ordering::Release);
+      crate::modal::force_redraw();
+   }
+}
+
+/// Drains any pending off-thread theme change on the GPUI UI thread with live
+/// `&mut App` (`app`). Called from `overlay_render_detour` and `section_detour`.
+///
+/// # Safety
+///
+/// `app` must be null or a valid live `&mut gpui::App` pointer on the UI thread.
+pub unsafe fn flush_pending(app: *mut c_void) {
+   if app.is_null() || !PENDING_APPLY.load(Ordering::Acquire) {
+      return;
+   }
+   let Some(hooks) = HOOKS.get() else {
+      return;
+   };
+   if !PENDING_APPLY.swap(false, Ordering::AcqRel) {
+      return;
+   }
+
+   let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      flush_pending_inner(hooks, app);
+   }));
+   if result.is_err() {
+      log::error!("mana theme: panic inside flush_pending");
+   }
+}
+
+fn flush_pending_inner(hooks: &Hooks, app: *mut c_void) {
+   let built = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let Some(base) = &state.base else {
+         return;
+      };
+      let base_mode = base.base_mode;
+      let (colors, mode, hits) = build_active_colors(hooks, base, state.active_spec.as_ref());
+      // Avoid replacing an unmodified theme on a no-op clear or a theme whose
+      // custom variables matched zero Mana tokens.
+      if hits == 0 && !state.patched_installed {
+         state.active_colors = Some(colors);
+         state.active_mode = base_mode;
+         return;
+      }
+      let base_raw = base.raw.clone();
+      let patched = if hits > 0 {
+         make_patched_theme(hooks, &mut state, &base_raw, &colors)
+      } else {
+         let orig_grad = base.orig_gradient_tag;
+         let orig_static = base.orig_static_colors_ptr;
+         make_restored_theme(hooks, &mut state, &base_raw, &colors, orig_grad, orig_static)
+      };
+      state.active_colors = Some(colors);
+      state.active_mode = mode;
+      state.patched_installed = hits > 0;
+      drop(state);
+      patched
+   };
+
+   let mut buf = built;
+   let _guard = DetourGuard::enter();
+   // SAFETY: `app` is a live `&mut gpui::App` on the UI thread, and `buf` is a
+   // valid owned `ManaTheme` whose `Arc` refcounts were balanced by
+   // `clone_base_raw`.
+   unsafe { (hooks.orig_set_global)(app, buf.as_mut_ptr()) };
+   // Discord switches themes with `set_global`, `sync_theme`, then
+   // `sync_pool`. When `sync_pool` returns false Discord redraws every window,
+   // which `force_redraw` does here either way.
+   // SAFETY: `app` is a live `&mut gpui::App` on the UI thread.
+   unsafe { (hooks.sync_theme)(app) };
+   // SAFETY: `app` is a live `&mut gpui::App` on the UI thread; null `arg0`
+   // means no per-window override (matching every Discord caller).
+   unsafe { (hooks.sync_pool)(std::ptr::null(), app) };
+   crate::modal::force_redraw();
+}
+
+unsafe extern "C" fn set_global_detour(app: *mut c_void, incoming: *mut u8) {
+   let Some(hooks) = HOOKS.get() else {
+      // Wait briefly if another thread entered the hook in the tiny window
+      // between `hook_entry` writing the jump and storing the trampoline.
+      let mut orig = ORIG_SET_GLOBAL.load(Ordering::Acquire);
+      while orig == 0 {
+         std::thread::yield_now();
+         orig = ORIG_SET_GLOBAL.load(Ordering::Acquire);
+      }
+      // SAFETY: `orig` is the published trampoline for `set_global`.
+      let orig_fn: SetGlobalFn = unsafe { std::mem::transmute::<usize, SetGlobalFn>(orig) };
+      unsafe { orig_fn(app, incoming) };
+      return;
+   };
+   if incoming.is_null() || IN_DETOUR.with(Cell::get) {
+      // SAFETY: forwarding untouched arguments to original `set_global`.
+      unsafe { (hooks.orig_set_global)(app, incoming) };
+      return;
+   }
+
+   let mut consumed = false;
+   let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      handle_set_global(hooks, app, incoming, &mut consumed);
+   }));
+   if result.is_err() {
+      log::error!("mana theme: panic inside set_global_detour");
+      if !consumed {
+         let _guard = DetourGuard::enter();
+         // SAFETY: `incoming` was neither dropped nor forwarded yet.
+         unsafe { (hooks.orig_set_global)(app, incoming) };
+      }
+   }
+}
+
+fn valid_theme_ref(hooks: &Hooks, incoming: &[u8]) -> bool {
+   let tag = read_u64(incoming, hooks.layout.theme_ref);
+   match tag {
+      0 => true,
+      1 => read_usize(incoming, hooks.layout.theme_ref + 8) != 0,
+      _ => false,
+   }
+}
+
+/// Returns whether `incoming`'s `colors_ref` points to one of Sunbird's own
+/// published `color_ring` slots (or `dummy_colors`), which happens when
+/// Discord clones the currently installed `ManaTheme` to update a non-color
+/// field and passes it back through `set_global`.
+fn is_own_color_ptr(hooks: &Hooks, state: &ThemeState, incoming: &[u8]) -> bool {
+   let tag = read_u64(incoming, hooks.layout.colors_ref);
+   if tag != 0 {
+      return false;
+   }
+   let ptr = read_usize(incoming, hooks.layout.colors_ref + 8);
+   ptr == hooks.dummy_colors_ptr()
+      || state
+         .color_ring
+         .iter()
+         .any(|slot| slot.as_ptr().cast::<u8>() as usize == ptr)
+}
+
+fn handle_set_global(hooks: &Hooks, app: *mut c_void, incoming: *mut u8, consumed: &mut bool) {
+   // SAFETY: `incoming` points to a live `hooks.size`-byte `ManaTheme`.
+   let incoming_slice = unsafe { std::slice::from_raw_parts(incoming, hooks.size) };
+   let decoded = valid_theme_ref(hooks, incoming_slice)
+      .then(|| read_semantic_colors(hooks, incoming_slice))
+      .flatten();
+
+   let Some(incoming_colors) = decoded else {
+      let old_base = {
+         let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+         state.active_colors = None;
+         state.patched_installed = false;
+         state.base.take()
+      };
+      if let Some(mut old) = old_base {
+         // SAFETY: `old.raw` is an owned snapshot with balanced refcounts.
+         unsafe { (hooks.drop_in_place)(old.raw.as_mut_ptr()) };
+      }
+      *consumed = true;
+      let _guard = DetourGuard::enter();
+      // SAFETY: unknown `ThemeRef` or `SemanticColorsRef` tag; pass through.
+      unsafe { (hooks.orig_set_global)(app, incoming) };
+      return;
+   };
+
+   let snapshot_raw = snapshot_base_raw(hooks, incoming_slice);
+   let incoming_mode = detect_mode(hooks, &incoming_colors);
+   let incoming_grad = incoming_slice[hooks.layout.gradient_tag];
+   let incoming_static_ptr = (read_u64(incoming_slice, hooks.layout.colors_ref) == 0)
+      .then(|| read_usize(incoming_slice, hooks.layout.colors_ref + 8))
+      .filter(|&ptr| ptr != 0);
+
+   let (old_base, patched) = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let own_ptr = is_own_color_ptr(hooks, &state, incoming_slice);
+      let mut snapshot_raw = snapshot_raw;
+      let old = if own_ptr && state.base.is_some() {
+         // Preserve Discord's unmodified base colors and saved `pre_filter`
+         // when Discord re-submits a clone of our already-patched `ManaTheme`,
+         // refreshing only the remaining non-color fields in `raw`.
+         let prev = state.base.as_mut().expect("checked is_some");
+         let pf = hooks.layout.pre_filter;
+         if read_u64(snapshot_raw.as_bytes(), pf) == u64::MAX {
+            snapshot_raw.as_bytes_mut()[pf..pf + 16]
+               .copy_from_slice(&prev.raw.as_bytes()[pf..pf + 16]);
+            write_u64(prev.raw.as_bytes_mut(), pf, u64::MAX);
+            write_usize(prev.raw.as_bytes_mut(), pf + 8, 0);
+         }
+         let prev_raw = std::mem::replace(&mut prev.raw, snapshot_raw);
+         Some(prev_raw)
+      } else {
+         state
+            .base
+            .replace(BaseSnapshot {
+               raw:                    snapshot_raw,
+               colors:                 incoming_colors,
+               base_mode:              incoming_mode,
+               orig_gradient_tag:      incoming_grad,
+               orig_static_colors_ptr: incoming_static_ptr,
+            })
+            .map(|b| b.raw)
+      };
+
+      let base = state.base.as_ref().expect("just inserted or preserved");
+      let base_mode = base.base_mode;
+      let base_raw = base.raw.clone();
+      let orig_grad = base.orig_gradient_tag;
+      let orig_static = base.orig_static_colors_ptr;
+      let (colors, mode, hits) = build_active_colors(hooks, base, state.active_spec.as_ref());
+      let patched = if hits > 0 {
+         Some(make_patched_theme(hooks, &mut state, &base_raw, &colors))
+      } else if own_ptr {
+         Some(make_restored_theme(
+            hooks,
+            &mut state,
+            &base_raw,
+            &colors,
+            orig_grad,
+            orig_static,
+         ))
+      } else {
+         None
+      };
+      state.active_colors = Some(colors);
+      state.active_mode = if hits > 0 { mode } else { base_mode };
+      state.patched_installed = hits > 0;
+      PENDING_APPLY.store(false, Ordering::Release);
+      drop(state);
+      (old, patched)
+   };
+
+   if let Some(mut old_raw) = old_base {
+      // SAFETY: `old_raw` is an owned snapshot with balanced refcounts.
+      unsafe { (hooks.drop_in_place)(old_raw.as_mut_ptr()) };
+   }
+
+   *consumed = true;
+   if let Some(mut patched) = patched {
+      // Drop Discord's original `incoming` via its own destructor (cleanly
+      // freeing its `pre_filter` and `SemanticColorsRef`).
+      // SAFETY: `incoming` was owned by this call and is not forwarded.
+      unsafe { (hooks.drop_in_place)(incoming) };
+      let _guard = DetourGuard::enter();
+      // SAFETY: `patched` is a valid owned `ManaTheme`.
+      unsafe { (hooks.orig_set_global)(app, patched.as_mut_ptr()) };
+   } else {
+      let _guard = DetourGuard::enter();
+      // SAFETY: forwarding Discord's unmodified `incoming`.
+      unsafe { (hooks.orig_set_global)(app, incoming) };
+   }
+}
+
+/// Copies the `SemanticColors` table out of `incoming`'s `SemanticColorsRef`.
+fn read_semantic_colors(hooks: &Hooks, incoming: &[u8]) -> Option<AlignedBuf> {
+   let tag = read_u64(incoming, hooks.layout.colors_ref);
+   let ptr = read_usize(incoming, hooks.layout.colors_ref + 8);
+   if ptr == 0 {
+      return None;
+   }
+   let data_ptr = match tag {
+      0 => ptr,
+      1 => ptr.checked_add(hooks.layout.arc_theme_colors)?,
+      2 => ptr.checked_add(hooks.layout.arc_colors_data)?,
+      _ => return None,
+   };
+   let mut out = AlignedBuf::filled(hooks.colors_size, 0);
+   // SAFETY: `data_ptr` points to Discord's live `SemanticColors` table.
+   unsafe {
+      std::ptr::copy_nonoverlapping(data_ptr as *const u8, out.as_mut_ptr(), hooks.colors_size);
+   }
+   Some(out)
+}
+
+/// Detects whether Discord's base `SemanticColors` table is dark or light by
+/// comparing `background-base-low` and `text-default` WCAG luminance.
+fn detect_mode(hooks: &Hooks, base_colors: &AlignedBuf) -> ThemeMode {
+   let mut scratch = base_colors.clone();
+   let read_lum = |table: &mut AlignedBuf, name: &str| -> Option<f32> {
+      let ptr = lookup_token_mut(hooks.get_mut, table, name)?;
+      // SAFETY: `lookup_token_mut` verified `ptr` is 4-aligned and inside `table`.
+      Some(Color::from_rgba_u32(unsafe { ptr.read() }).relative_luminance())
+   };
+   let Some(bg_lum) = read_lum(&mut scratch, "background-base-low") else {
+      return ThemeMode::Dark;
+   };
+   let is_light = read_lum(&mut scratch, "text-default")
+      .map_or(bg_lum > 0.35, |text_lum| bg_lum > text_lum);
+   if is_light {
+      ThemeMode::Light
+   } else {
+      ThemeMode::Dark
+   }
+}
+
+/// Builds a self-contained `BaseSnapshot` byte buffer from `incoming`:
+/// increments `ThemeRef` and `pre_filter` `Arc` strong counts when present,
+/// points `colors_ref` at `dummy_colors`, and clears `gradient_tag` to
+/// `gradient_none`. `pre_filter` is kept intact so clearing a theme restores it.
+fn snapshot_base_raw(hooks: &Hooks, incoming: &[u8]) -> AlignedBuf {
+   let mut raw = AlignedBuf::from_bytes(incoming);
+   bump_theme_ref_arc(hooks, raw.as_bytes());
+   bump_pre_filter_arc(hooks, raw.as_bytes());
+
+   let dummy_ptr = hooks.dummy_colors_ptr();
+   let bytes = raw.as_bytes_mut();
+   write_u64(bytes, hooks.layout.colors_ref, 0);
+   write_usize(bytes, hooks.layout.colors_ref + 8, dummy_ptr);
+   bytes[hooks.layout.gradient_tag] = hooks.layout.gradient_none;
+   raw
+}
+
+/// Clones a `BaseSnapshot`'s raw `ManaTheme` bytes, incrementing its `ThemeRef`
+/// `Arc` strong count if tag 1 so the clone is independently droppable.
+fn clone_base_raw(hooks: &Hooks, base: &AlignedBuf) -> AlignedBuf {
+   bump_theme_ref_arc(hooks, base.as_bytes());
+   base.clone()
+}
+
+fn bump_theme_ref_arc(hooks: &Hooks, raw: &[u8]) {
+   let tag = read_u64(raw, hooks.layout.theme_ref);
+   if tag == 1 {
+      let ptr = read_usize(raw, hooks.layout.theme_ref + 8);
+      if ptr != 0 {
+         // SAFETY: tag 1 `ThemeRef` holds a live `ArcInner` whose first word is
+         // the `AtomicUsize` strong count.
+         let strong = unsafe { &*(ptr as *const AtomicUsize) };
+         strong.fetch_add(1, Ordering::Relaxed);
+      }
+   }
+}
+
+fn bump_pre_filter_arc(hooks: &Hooks, raw: &[u8]) {
+   let tag = read_u64(raw, hooks.layout.pre_filter);
+   if tag == 1 || tag == 2 {
+      let ptr = read_usize(raw, hooks.layout.pre_filter + 8);
+      if ptr != 0 {
+         // SAFETY: tag 1/2 `SemanticColorsRef` holds a live `ArcInner` whose
+         // first word is the `AtomicUsize` strong count.
+         let strong = unsafe { &*(ptr as *const AtomicUsize) };
+         strong.fetch_add(1, Ordering::Relaxed);
+      }
+   }
+}
+
+/// Clones `base_raw` with balanced `ThemeRef` refcounts, clears `pre_filter`
+/// to `None` (without bumping it), and installs `colors` into the next
+/// `color_ring` slot as tag 0.
+fn make_patched_theme(
+   hooks: &Hooks,
+   state: &mut ThemeState,
+   base_raw: &AlignedBuf,
+   colors: &AlignedBuf,
+) -> AlignedBuf {
+   let mut patched = clone_base_raw(hooks, base_raw);
+   let published = publish_color_table(state, colors);
+   let bytes = patched.as_bytes_mut();
+   write_u64(bytes, hooks.layout.colors_ref, 0);
+   write_usize(bytes, hooks.layout.colors_ref + 8, published as usize);
+   write_u64(bytes, hooks.layout.pre_filter, u64::MAX);
+   write_usize(bytes, hooks.layout.pre_filter + 8, 0);
+   patched
+}
+
+/// Clones `base_raw` and restores Discord's original `pre_filter`, Nitro
+/// gradient tag, and static `SemanticColors` pointer (when static).
+fn make_restored_theme(
+   hooks: &Hooks,
+   state: &mut ThemeState,
+   base_raw: &AlignedBuf,
+   colors: &AlignedBuf,
+   orig_gradient_tag: u8,
+   orig_static_colors_ptr: Option<usize>,
+) -> AlignedBuf {
+   let mut restored = clone_base_raw(hooks, base_raw);
+   bump_pre_filter_arc(hooks, restored.as_bytes());
+   let colors_ptr = orig_static_colors_ptr
+      .unwrap_or_else(|| publish_color_table(state, colors) as usize);
+   let bytes = restored.as_bytes_mut();
+   write_u64(bytes, hooks.layout.colors_ref, 0);
+   write_usize(bytes, hooks.layout.colors_ref + 8, colors_ptr);
+   bytes[hooks.layout.gradient_tag] = orig_gradient_tag;
+   restored
+}
+
+/// Copies `table` into the next slot of `state.color_ring`, allocating up to
+/// [`COLOR_RING_SLOTS`] stable 8-byte-aligned heap buffers once and reusing
+/// them round-robin so every `set_global` receives a distinct pointer with
+/// zero unbounded heap leak.
+fn publish_color_table(state: &mut ThemeState, table: &AlignedBuf) -> *const u8 {
+   let words_len = table.words.len();
+   let slot_idx = state.ring_next;
+   state.ring_next = (slot_idx + 1) % COLOR_RING_SLOTS;
+   if slot_idx >= state.color_ring.len() {
+      state
+         .color_ring
+         .push(vec![0u64; words_len].into_boxed_slice());
+   }
+   let slot = &mut state.color_ring[slot_idx];
+   slot[..words_len].copy_from_slice(&table.words);
+   slot.as_ptr().cast::<u8>()
+}
+
+/// Applies pre-resolved `spec` (if present) onto `base.colors` via Discord's
+/// `get_mut`, returning the mutated table, effective mode, and count of
+/// matched Mana tokens.
+fn build_active_colors(
+   hooks: &Hooks,
+   base: &BaseSnapshot,
+   spec: Option<&CachedSpec>,
+) -> (AlignedBuf, ThemeMode, usize) {
+   let mut table = base.colors.clone();
+   let Some(spec) = spec else {
+      return (table, base.base_mode, 0);
+   };
+   let resolved = spec.for_mode(base.base_mode);
+   let mut hits = 0usize;
+   for (name, color) in &resolved.tokens {
+      if let Some(ptr) = lookup_token_mut(hooks.get_mut, &mut table, name) {
+         // SAFETY: `lookup_token_mut` verified `ptr` is 4-aligned and inside `table`.
+         unsafe { ptr.write(color.to_rgba_u32()) };
+         hits += 1;
+      }
+   }
+   (table, resolved.mode, hits)
+}
+
+fn read_u64(buf: &[u8], at: usize) -> u64 {
+   u64::from_le_bytes(buf[at..at + 8].try_into().unwrap_or_default())
+}
+
+fn write_u64(buf: &mut [u8], at: usize, value: u64) {
+   buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_usize(buf: &[u8], at: usize) -> usize {
+   usize::from_le_bytes(
+      buf[at..at + std::mem::size_of::<usize>()]
+         .try_into()
+         .unwrap_or_default(),
+   )
+}
+
+fn write_usize(buf: &mut [u8], at: usize, value: usize) {
+   buf[at..at + std::mem::size_of::<usize>()].copy_from_slice(&value.to_le_bytes());
+}

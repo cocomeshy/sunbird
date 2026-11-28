@@ -30,6 +30,7 @@ use crate::theme_css::{
 
 static SCENE: OnceLock<SceneDraw> = OnceLock::new();
 static THEME: LazyLock<RwLock<Theme>> = LazyLock::new(RwLock::default);
+static HOME: OnceLock<PathBuf> = OnceLock::new();
 
 /// Observes the renderer's `draw`. Elsewhere themes stay off, since the
 /// locator only decodes Win64 builds.
@@ -40,11 +41,22 @@ pub fn install(image: &Image<'static>) {
 
 #[must_use]
 pub fn is_supported() -> bool {
-   SCENE.get().is_some()
+   crate::mana_theme::is_supported() || SCENE.get().is_some()
 }
 
 /// Applies `.theme.css` text now. Returns whether it themes anything.
 pub fn set_css(css: &str) -> bool {
+   if crate::mana_theme::is_supported() {
+      // Keep `--radius-scale` active on Windows's Scene hook.
+      let radius_scale = parse_theme_css(css).radius_scale;
+      let scene_active = cfg!(windows) && radius_scale.is_some();
+      *THEME.write().unwrap_or_else(PoisonError::into_inner) = Theme {
+         active: scene_active,
+         radius_scale,
+         ..Theme::default()
+      };
+      return crate::mana_theme::set_css(css) || scene_active;
+   }
    let theme = parse_theme_css(css);
    let active = theme.active;
    *THEME.write().unwrap_or_else(PoisonError::into_inner) = theme;
@@ -52,42 +64,91 @@ pub fn set_css(css: &str) -> bool {
    active
 }
 
+/// The `--radius-scale` a theme file in `dir` sets, if it reads and parses.
+pub fn file_radius(dir: &Path, file: &str) -> Option<f32> {
+   phoenix_themes::read_contained_theme(dir, file)
+      .ok()
+      .and_then(|raw| phoenix_themes::ThemeSpec::parse_file(file, &raw).ok())
+      .and_then(|spec| spec.radius_scale)
+}
+
+/// Syncs `--radius-scale` from an applied theme file onto Windows's Scene hook.
+/// Returns whether `--radius-scale` is active on the Scene hook.
+pub fn sync_file_radius(dir: &Path, file: &str) -> bool {
+   let radius_scale = file_radius(dir, file);
+   let scene_active = cfg!(windows) && radius_scale.is_some();
+   *THEME.write().unwrap_or_else(PoisonError::into_inner) = Theme {
+      active: scene_active,
+      radius_scale,
+      ..Theme::default()
+   };
+   if scene_active {
+      crate::modal::force_redraw();
+   }
+   scene_active
+}
+
+/// Syncs `--radius-scale` from `<home>/themes.json` onto Windows's Scene hook
+/// at startup and when restoring persisted themes after `clear()` or unload.
+pub fn sync_persisted_radius(home: &Path) {
+   let _ = HOME.set(home.to_owned());
+   let cfg = phoenix_themes::load_config(&home.join("themes.json"));
+   let radius_scale =
+      phoenix_themes::load_active_spec(&home.join("themes"), &cfg).and_then(|s| s.radius_scale);
+   let scene_active = cfg!(windows) && radius_scale.is_some();
+   *THEME.write().unwrap_or_else(PoisonError::into_inner) = Theme {
+      active: scene_active,
+      radius_scale,
+      ..Theme::default()
+   };
+   if scene_active {
+      crate::modal::force_redraw();
+   }
+}
+
 pub fn clear() {
+   if crate::mana_theme::is_supported() {
+      if let Some(home) = HOME.get() {
+         sync_persisted_radius(home);
+      } else {
+         *THEME.write().unwrap_or_else(PoisonError::into_inner) = Theme::default();
+      }
+      crate::mana_theme::restore_persisted();
+      return;
+   }
    set_css("");
 }
 
-/// A `.theme.css` file in the themes folder.
+/// A `.theme.css` or `.theme.json` file in the themes folder.
 pub struct ThemeFile {
-   pub file: String,
-   pub name: String,
+   pub file:        String,
+   pub name:        String,
+   pub description: Option<String>,
+   pub author:      Option<String>,
 }
 
-/// `*.theme.css` files in `dir`, named by their `@name` header.
+/// `*.theme.css` and `*.theme.json` files in `dir`, named by their metadata.
 #[must_use]
 pub fn list(dir: &Path) -> Vec<ThemeFile> {
-   let mut out: Vec<ThemeFile> = std::fs::read_dir(dir)
+   phoenix_themes::list_themes(dir)
       .into_iter()
-      .flatten()
-      .flatten()
-      .filter_map(|entry| {
-         let file = entry.file_name().into_string().ok()?;
-         let stem = file.strip_suffix(".theme.css")?.to_owned();
-         let name = std::fs::read_to_string(entry.path())
-            .map(|css| parse_theme_css(&css).name)
-            .ok()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(stem);
-         Some(ThemeFile { file, name })
+      .map(|entry| {
+         ThemeFile {
+            file:        entry.file,
+            name:        entry.meta.name,
+            description: entry.meta.description,
+            author:      entry.meta.author,
+         }
       })
-      .collect();
-   out.sort_by(|a, b| a.file.cmp(&b.file));
-   out
+      .collect()
 }
 
 pub fn open_dir(dir: &Path) {
    let _ = std::fs::create_dir_all(dir);
    let opener = if cfg!(windows) {
       "explorer"
+   } else if cfg!(target_os = "macos") {
+      "open"
    } else {
       "xdg-open"
    };
