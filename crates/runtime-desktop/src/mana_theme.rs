@@ -12,11 +12,13 @@ use std::{
    cell::Cell,
    collections::BTreeMap,
    ffi::c_void,
+   fs,
    path::{
       Path,
       PathBuf,
    },
    sync::{
+      Condvar,
       LazyLock,
       Mutex,
       OnceLock,
@@ -24,9 +26,14 @@ use std::{
       atomic::{
          AtomicBool,
          AtomicU32,
+         AtomicU64,
          AtomicUsize,
          Ordering,
       },
+   },
+   time::{
+      Duration,
+      SystemTime,
    },
 };
 
@@ -47,6 +54,8 @@ use phoenix_themes::{
    load_active_spec,
    load_config,
    read_contained_theme,
+   save_config,
+   valid_theme_file,
 };
 use serde::Serialize;
 
@@ -220,6 +229,13 @@ struct ThemeState {
    home:              Option<PathBuf>,
    config:            ThemeConfig,
    active_spec:       Option<CachedSpec>,
+   /// Monotonic commit counter advanced under `STATE` on every theme/watch
+   /// mutation so stale reloads or overlapping applies cannot win out of order.
+   generation:        u64,
+   /// Whether an ephemeral JS override (`setCss` / `apply_file_ephemeral`) is
+   /// currently displayed on screen instead of the persisted `themes.json`
+   /// stack.
+   ephemeral_active:  bool,
    base:              Option<BaseSnapshot>,
    /// Whether the currently installed `ManaTheme` global is a Sunbird-patched
    /// copy (so a no-op clear does not overwrite an unmodified Nitro gradient).
@@ -243,6 +259,8 @@ impl Default for ThemeState {
          home:                None,
          config:              ThemeConfig::default(),
          active_spec:         None,
+         generation:          0,
+         ephemeral_active:    false,
          base:                None,
          patched_installed:   false,
          active_colors:       None,
@@ -408,12 +426,237 @@ pub fn is_supported() -> bool {
    HOOKS.get().is_some() && (crate::modal::hooked() || crate::settings::hooked())
 }
 
+static WATCH_GEN: AtomicU64 = AtomicU64::new(0);
+static WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
+static WATCH_STATE: LazyLock<(Mutex<WatchSlot>, Condvar)> =
+   LazyLock::new(|| (Mutex::new(WatchSlot::default()), Condvar::new()));
+
+/// Lightweight metadata stamp (`mtime` + byte length) used by the watcher so
+/// idle polling does zero file reads or hashing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+   modified: SystemTime,
+   len:      u64,
+}
+
+#[derive(Default)]
+struct WatchSlot {
+   /// Highest commit generation published to the watcher slot so an older
+   /// overlapping commit can never overwrite a newer watch or clear.
+   generation: u64,
+   watched:    Option<WatchedTheme>,
+}
+
+#[derive(Clone, Debug)]
+struct WatchedTheme {
+   themes_dir: PathBuf,
+   file:       String,
+   persisted:  bool,
+   generation: u64,
+   /// Metadata stamp of the contained file that was last applied.
+   stamp:      Option<FileStamp>,
+   /// A changed stamp seen on the previous poll, applied once the next poll
+   /// sees it unchanged.
+   pending:    Option<FileStamp>,
+}
+
+/// Reads metadata for a theme file strictly contained within `themes_dir`
+/// (rejecting traversal and symlinks escaping `themes_dir`) without reading
+/// file contents.
+fn file_stamp(themes_dir: &Path, file: &str) -> Option<FileStamp> {
+   if !valid_theme_file(file) {
+      return None;
+   }
+   let canonical_dir = fs::canonicalize(themes_dir).ok()?;
+   let canonical_file = fs::canonicalize(themes_dir.join(file)).ok()?;
+   if !canonical_file.starts_with(&canonical_dir) || !canonical_file.is_file() {
+      return None;
+   }
+   let meta = fs::metadata(&canonical_file).ok()?;
+   Some(FileStamp {
+      modified: meta.modified().ok()?,
+      len:      meta.len(),
+   })
+}
+
+/// Reads and parses a contained theme file, capturing its metadata stamp
+/// before the read so an edit landing during the read is never missed.
+/// Rejects an empty file so a save that truncates first never wipes the
+/// active theme.
+fn read_theme_file_stamped(
+   themes_dir: &Path,
+   file: &str,
+) -> Result<(ThemeSpec, Option<FileStamp>), String> {
+   let stamp = file_stamp(themes_dir, file);
+   let raw = read_contained_theme(themes_dir, file)?;
+   if file_stamp(themes_dir, file) != stamp {
+      return Err(format!("theme {file} changed while reading"));
+   }
+   if raw.trim().is_empty() {
+      return Err(format!("theme {file} is empty"));
+   }
+   let spec = ThemeSpec::parse_file(file, &raw)?;
+   Ok((spec, stamp))
+}
+
+fn commit_generation(state: &mut ThemeState) -> u64 {
+   state.generation = state.generation.saturating_add(1);
+   WATCH_GEN.store(state.generation, Ordering::Release);
+   state.generation
+}
+
+/// Publishes a watch update for `gen_id`, refusing any stale commit older than
+/// the slot's current generation.
+fn publish_watch(gen_id: u64, next: Option<WatchedTheme>) {
+   let (lock, cvar) = &*WATCH_STATE;
+   let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+   if gen_id < slot.generation {
+      return;
+   }
+   let should_spawn = next.is_some();
+   slot.generation = gen_id;
+   slot.watched = next;
+   cvar.notify_one();
+   drop(slot);
+   if should_spawn
+      && !WATCHER_STARTED.swap(true, Ordering::AcqRel)
+      && let Err(err) = std::thread::Builder::new()
+         .name("sunbird-theme-watch".to_owned())
+         .spawn(watch_loop)
+   {
+      WATCHER_STARTED.store(false, Ordering::Release);
+      log::warn!("mana theme: could not spawn hot-reload watcher: {err}");
+   }
+}
+
+struct WatcherExitGuard;
+
+impl Drop for WatcherExitGuard {
+   fn drop(&mut self) {
+      WATCHER_STARTED.store(false, Ordering::Release);
+   }
+}
+
+/// Runs one metadata check for `watched`. A changed file applies only once
+/// its `mtime` and length held for a whole poll interval, so a save still
+/// being written is never read.
+fn poll_watched_once(watched: &WatchedTheme) {
+   let current = file_stamp(&watched.themes_dir, &watched.file);
+   if current.is_none() || current == watched.stamp {
+      return;
+   }
+   let applied = if current == watched.pending {
+      match reload_watched(watched) {
+         Ok((_, stamp)) => Some(stamp),
+         Err(err) => {
+            log::warn!("mana theme: hot-reload skipped for {}: {err}", watched.file);
+            Some(current)
+         },
+      }
+   } else {
+      None
+   };
+   let (lock, _) = &*WATCH_STATE;
+   let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
+   if let Some(active) = slot
+      .watched
+      .as_mut()
+      .filter(|active| active.generation == watched.generation)
+   {
+      match applied {
+         Some(stamp) => {
+            active.stamp = stamp;
+            active.pending = None;
+         },
+         None => active.pending = current,
+      }
+   }
+   drop(slot);
+}
+
+fn watch_loop() {
+   const POLL_INTERVAL: Duration = Duration::from_millis(600);
+   let _exit_guard = WatcherExitGuard;
+   let (lock, cvar) = &*WATCH_STATE;
+   loop {
+      let watched = {
+         let mut guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+         while guard.watched.is_none() {
+            guard = cvar.wait(guard).unwrap_or_else(PoisonError::into_inner);
+         }
+         let (next_guard, _) = cvar
+            .wait_timeout(guard, POLL_INTERVAL)
+            .unwrap_or_else(PoisonError::into_inner);
+         guard = next_guard;
+         guard.watched.clone()
+      };
+      if let Some(watched) = watched {
+         poll_watched_once(&watched);
+      }
+   }
+}
+
+fn reload_watched(watched: &WatchedTheme) -> Result<(bool, Option<FileStamp>), String> {
+   let (parsed, stamp) = read_theme_file_stamped(&watched.themes_dir, &watched.file)?;
+   let combined = if watched.persisted {
+      let quick_css = STATE
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner)
+         .config
+         .quick_css
+         .clone();
+      if quick_css.trim().is_empty() {
+         parsed
+      } else {
+         parsed.merge(&ThemeSpec::parse_css(&quick_css))
+      }
+   } else {
+      parsed
+   };
+   let cached = CachedSpec::from_spec(&combined);
+   let active = cached.is_some();
+   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+   if state.generation != watched.generation
+      || WATCH_GEN.load(Ordering::Acquire) != watched.generation
+   {
+      return Ok((false, stamp));
+   }
+   sync_radius_scale_for_state(&state, cached.as_ref());
+   state.active_spec = cached;
+   drop(state);
+   request_apply();
+   Ok((active, stamp))
+}
+
+fn make_watch(
+   themes_dir: PathBuf,
+   file: &str,
+   persisted: bool,
+   generation: u64,
+   stamp: Option<FileStamp>,
+) -> Option<WatchedTheme> {
+   valid_theme_file(file).then(|| {
+      WatchedTheme {
+         themes_dir,
+         file: file.to_owned(),
+         persisted,
+         generation,
+         stamp,
+         pending: None,
+      }
+   })
+}
+
 /// Loads `<home>/themes.json` and the active theme file on boot so themes
 /// apply on frame 1 when Discord initializes `ManaTheme`.
 pub fn load_persisted(home: &Path) {
    let config_path = home.join("themes.json");
    let themes_dir = home.join("themes");
    let config = load_config(&config_path);
+   let initial_stamp = config
+      .active
+      .as_deref()
+      .and_then(|file| file_stamp(&themes_dir, file));
    let loaded = load_active_spec(&themes_dir, &config);
    let cached = loaded.as_ref().and_then(CachedSpec::from_spec);
    if loaded.is_some() && cached.is_none() {
@@ -422,23 +665,24 @@ pub fn load_persisted(home: &Path) {
          config.active
       );
    }
-   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-   state.home = Some(home.to_owned());
-   state.config = config;
-   sync_radius_scale_for_state(&state, cached.as_ref());
-   state.active_spec = cached;
-   let should_flush = state.base.is_some();
-   drop(state);
+   let active_file = config.active.clone();
+   let (gen_id, should_flush) = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let gen_id = commit_generation(&mut state);
+      state.home = Some(home.to_owned());
+      state.config = config;
+      state.ephemeral_active = false;
+      sync_radius_scale_for_state(&state, cached.as_ref());
+      state.active_spec = cached;
+      (gen_id, state.base.is_some())
+   };
+   let watch = active_file
+      .as_deref()
+      .and_then(|file| make_watch(themes_dir, file, true, gen_id, initial_stamp));
+   publish_watch(gen_id, watch);
    if should_flush {
       request_apply();
    }
-}
-
-/// Reads and parses a theme file contained within `themes_dir` (rejecting
-/// traversal and symlinks escaping `themes_dir`).
-fn read_theme_file(themes_dir: &Path, file: &str) -> Result<ThemeSpec, String> {
-   let raw = read_contained_theme(themes_dir, file)?;
-   ThemeSpec::parse_file(file, &raw)
 }
 
 /// Applies raw `.theme.css` text live without changing persisted `themes.json`
@@ -446,10 +690,15 @@ fn read_theme_file(themes_dir: &Path, file: &str) -> Result<ThemeSpec, String> {
 pub fn set_css(css: &str) -> bool {
    let cached = CachedSpec::from_spec(&ThemeSpec::parse_css(css));
    let active = cached.is_some();
-   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-   sync_radius_scale_for_state(&state, cached.as_ref());
-   state.active_spec = cached;
-   drop(state);
+   let gen_id = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let gen_id = commit_generation(&mut state);
+      state.ephemeral_active = true;
+      sync_radius_scale_for_state(&state, cached.as_ref());
+      state.active_spec = cached;
+      gen_id
+   };
+   publish_watch(gen_id, None);
    request_apply();
    active
 }
@@ -457,14 +706,20 @@ pub fn set_css(css: &str) -> bool {
 /// Applies a theme file from `themes_dir` live without mutating persisted
 /// `themes.json` (used by JS `phoenix.themes.apply`).
 pub fn apply_file_ephemeral(themes_dir: &Path, file: &str) -> Result<bool, String> {
-   let parsed = read_theme_file(themes_dir, file)?;
+   let (parsed, stamp) = read_theme_file_stamped(themes_dir, file)?;
    let Some(cached) = CachedSpec::from_spec(&parsed) else {
       return Err(format!("theme {file} sets no supported tokens"));
    };
-   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-   sync_radius_scale_for_state(&state, Some(&cached));
-   state.active_spec = Some(cached);
-   drop(state);
+   let gen_id = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let gen_id = commit_generation(&mut state);
+      state.ephemeral_active = true;
+      sync_radius_scale_for_state(&state, Some(&cached));
+      state.active_spec = Some(cached);
+      gen_id
+   };
+   let watch = make_watch(themes_dir.to_owned(), file, false, gen_id, stamp);
+   publish_watch(gen_id, watch);
    request_apply();
    Ok(true)
 }
@@ -476,15 +731,122 @@ pub fn restore_persisted() {
       let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
       (state.home.clone(), state.config.clone())
    };
+   let initial_stamp = home
+      .as_ref()
+      .zip(cfg.active.as_deref())
+      .and_then(|(h, file)| file_stamp(&h.join("themes"), file));
    let cached = home
       .as_ref()
       .and_then(|h| load_active_spec(&h.join("themes"), &cfg))
       .and_then(|s| CachedSpec::from_spec(&s));
-   let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-   sync_radius_scale_for_state(&state, cached.as_ref());
-   state.active_spec = cached;
-   drop(state);
+   let gen_id = {
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      let gen_id = commit_generation(&mut state);
+      state.ephemeral_active = false;
+      sync_radius_scale_for_state(&state, cached.as_ref());
+      state.active_spec = cached;
+      gen_id
+   };
+   let watch = home
+      .as_ref()
+      .zip(cfg.active.as_deref())
+      .and_then(|(h, file)| make_watch(h.join("themes"), file, true, gen_id, initial_stamp));
+   publish_watch(gen_id, watch);
    request_apply();
+}
+
+/// Updates persisted `quick_css` in `themes.json` and re-applies it layered on
+/// top of any active persisted theme. Leaves an active ephemeral JS override
+/// untouched on screen while still persisting `quick_css`.
+pub fn set_quick_css(css: &str) -> Result<(), String> {
+   for _ in 0..3 {
+      let (home, mut cfg) = {
+         let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+         let Some(home) = state.home.clone() else {
+            return Err("sunbird home directory is not initialized".to_owned());
+         };
+         (home, state.config.clone())
+      };
+      css.clone_into(&mut cfg.quick_css);
+      let themes_dir = home.join("themes");
+      let initial_stamp = cfg
+         .active
+         .as_deref()
+         .and_then(|file| file_stamp(&themes_dir, file));
+      let cached = load_active_spec(&themes_dir, &cfg).and_then(|s| CachedSpec::from_spec(&s));
+
+      let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+      if state.home.as_deref() != Some(home.as_path()) || state.config.active != cfg.active {
+         continue;
+      }
+      css.clone_into(&mut state.config.quick_css);
+      let save = (home.join("themes.json"), state.config.clone());
+      let apply_now = if state.ephemeral_active {
+         None
+      } else {
+         let gen_id = commit_generation(&mut state);
+         sync_radius_scale_for_state(&state, cached.as_ref());
+         state.active_spec = cached;
+         let watch = cfg
+            .active
+            .as_deref()
+            .and_then(|file| make_watch(themes_dir, file, true, gen_id, initial_stamp));
+         Some((gen_id, watch))
+      };
+      drop(state);
+      if let Some((gen_id, watch)) = apply_now {
+         publish_watch(gen_id, watch);
+         request_apply();
+      }
+      if let Err(err) = save_config(&save.0, &save.1) {
+         log::warn!("mana theme: saving themes.json: {err}");
+         return Err(format!("saving themes.json: {err}"));
+      }
+      return Ok(());
+   }
+   log::warn!("mana theme: set_quick_css aborted after concurrent theme switches");
+   Err("concurrent theme switch while saving quick CSS".to_owned())
+}
+
+/// Returns the currently persisted `quick_css` string from `themes.json`.
+#[must_use]
+pub fn quick_css() -> String {
+   STATE
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .config
+      .quick_css
+      .clone()
+}
+
+/// Immediately reloads the currently watched theme file from disk.
+///
+/// Used by `POST /themes/reload` and `phoenix.themes.reload()`. Returns
+/// `Ok(None)` without disturbing an inline `setCss` override when no file is
+/// watched, or `Ok(Some(active))` when a watched file was reloaded.
+pub fn reload_active() -> Result<Option<bool>, String> {
+   let watched = WATCH_STATE
+      .0
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .watched
+      .clone();
+   let Some(watched) = watched else {
+      return Ok(None);
+   };
+   let (active, stamp) = reload_watched(&watched)?;
+   let mut slot = WATCH_STATE
+      .0
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+   if let Some(w) = slot.watched.as_mut()
+      && w.generation == watched.generation
+   {
+      w.stamp = stamp;
+      w.pending = None;
+   }
+   drop(slot);
+   Ok(Some(active))
 }
 
 fn sync_radius_scale(scale: Option<f32>) -> u32 {
@@ -1187,4 +1549,192 @@ fn read_usize(buf: &[u8], at: usize) -> usize {
 
 fn write_usize(buf: &mut [u8], at: usize, value: usize) {
    buf[at..at + std::mem::size_of::<usize>()].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+   use std::sync::{
+      Mutex,
+      PoisonError,
+   };
+
+   use phoenix_themes::{
+      ThemeConfig,
+      load_config,
+      save_config,
+   };
+
+   use super::{
+      STATE,
+      WATCH_STATE,
+      apply_file_ephemeral,
+      commit_generation,
+      load_persisted,
+      poll_watched_once,
+      publish_watch,
+      quick_css,
+      radius_scale,
+      reload_active,
+      set_css,
+      set_quick_css,
+      sync_radius_scale,
+   };
+
+   static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+   fn reset_for_test() {
+      let gen_id = {
+         let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+         let next_gen = commit_generation(&mut state);
+         state.home = None;
+         state.config = ThemeConfig::default();
+         state.active_spec = None;
+         state.ephemeral_active = false;
+         drop(state);
+         sync_radius_scale(None);
+         next_gen
+      };
+      publish_watch(gen_id, None);
+   }
+
+   #[test]
+   fn hot_reload_reapplies_edits_and_survives_malformed_file() {
+      let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+      reset_for_test();
+      let tmp = std::env::temp_dir().join(format!("sunbird-watch-test-{}", std::process::id()));
+      let themes_dir = tmp.join("themes");
+      let _ = std::fs::remove_dir_all(&tmp);
+      std::fs::create_dir_all(&themes_dir).expect("create temp themes dir");
+
+      let path = themes_dir.join("live.theme.json");
+      std::fs::write(
+         &path,
+         r##"{"name":"Live","radius_scale":1.25,"tokens":{"background-base-low":"#111111"}}"##,
+      )
+      .expect("write initial json");
+
+      assert!(apply_file_ephemeral(&themes_dir, "live.theme.json").expect("apply initial"));
+      assert_eq!(radius_scale(), Some(1.25));
+
+      std::fs::write(
+         &path,
+         r##"{"name":"Live","radius_scale":1.75,"tokens":{"background-base-low":"#222222"}}"##,
+      )
+      .expect("write updated json");
+      assert_eq!(reload_active().expect("reload updated"), Some(true));
+      assert_eq!(radius_scale(), Some(1.75));
+
+      // Simulate a partial/corrupt mid-save write: reload fails cleanly without
+      // clobbering the active radius scale.
+      std::fs::write(&path, "{ incomplete json").expect("write malformed json");
+      assert!(reload_active().is_err());
+      assert_eq!(radius_scale(), Some(1.75));
+
+      // Same protection for an empty `.theme.css` mid-save write.
+      let css_path = themes_dir.join("live.theme.css");
+      std::fs::write(&css_path, ":root { --radius-scale: 1.3; }").expect("write css");
+      assert!(apply_file_ephemeral(&themes_dir, "live.theme.css").expect("apply css"));
+      assert_eq!(radius_scale(), Some(1.3));
+      std::fs::write(&css_path, "").expect("write empty css");
+      assert!(reload_active().is_err());
+      assert_eq!(radius_scale(), Some(1.3));
+
+      // Inline set_css clears the watch; reload_active must return `Ok(None)`
+      // without clobbering the inline override.
+      assert!(set_css(":root { --radius-scale: 1.4; }"));
+      assert_eq!(reload_active().expect("no-op reload on inline css"), None);
+      assert_eq!(radius_scale(), Some(1.4));
+
+      reset_for_test();
+      let _ = std::fs::remove_dir_all(&tmp);
+   }
+
+   #[test]
+   fn metadata_poll_detects_edit_without_reading_when_unchanged() {
+      let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+      reset_for_test();
+      let tmp = std::env::temp_dir().join(format!("sunbird-poll-test-{}", std::process::id()));
+      let themes_dir = tmp.join("themes");
+      let _ = std::fs::remove_dir_all(&tmp);
+      std::fs::create_dir_all(&themes_dir).expect("create temp themes dir");
+
+      let path = themes_dir.join("auto.theme.css");
+      std::fs::write(&path, ":root { --radius-scale: 1.1; }").expect("write initial css");
+      assert!(apply_file_ephemeral(&themes_dir, "auto.theme.css").expect("apply initial"));
+      assert_eq!(radius_scale(), Some(1.1));
+
+      let watched = || {
+         WATCH_STATE
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watched
+            .clone()
+            .expect("watched slot populated")
+      };
+      // Unchanged metadata must skip reload immediately.
+      poll_watched_once(&watched());
+      assert_eq!(radius_scale(), Some(1.1));
+
+      // Different byte length changes the metadata stamp even within the same
+      // filesystem timestamp granularity. The first poll only notes the new
+      // stamp, and the next one applies it once it held.
+      std::fs::write(&path, ":root { --radius-scale: 1.9; /* edited */ }")
+         .expect("write edited css");
+      poll_watched_once(&watched());
+      assert_eq!(radius_scale(), Some(1.1));
+      poll_watched_once(&watched());
+      assert_eq!(radius_scale(), Some(1.9));
+
+      reset_for_test();
+      let _ = std::fs::remove_dir_all(&tmp);
+   }
+
+   #[test]
+   fn quick_css_persists_and_layers_over_active_theme() {
+      let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+      reset_for_test();
+      let tmp = std::env::temp_dir().join(format!("sunbird-qcss-test-{}", std::process::id()));
+      let themes_dir = tmp.join("themes");
+      let _ = std::fs::remove_dir_all(&tmp);
+      std::fs::create_dir_all(&themes_dir).expect("create temp themes dir");
+
+      std::fs::write(
+         themes_dir.join("base.theme.css"),
+         ":root { --bg-primary: #10141e; --radius-scale: 1.2; }",
+      )
+      .expect("write base css");
+      save_config(
+         &tmp.join("themes.json"),
+         &ThemeConfig {
+            active:    Some("base.theme.css".to_owned()),
+            quick_css: String::new(),
+         },
+      )
+      .expect("save initial config");
+
+      load_persisted(&tmp);
+      assert_eq!(radius_scale(), Some(1.2));
+
+      set_quick_css(":root { --radius-scale: 1.8; }").expect("set quick css");
+      assert_eq!(quick_css(), ":root { --radius-scale: 1.8; }");
+      assert_eq!(radius_scale(), Some(1.8));
+
+      let persisted = load_config(&tmp.join("themes.json"));
+      assert_eq!(persisted.active.as_deref(), Some("base.theme.css"));
+      assert_eq!(persisted.quick_css, ":root { --radius-scale: 1.8; }");
+
+      // While an ephemeral JS override is active, set_quick_css persists the
+      // text but leaves the ephemeral override on screen.
+      assert!(set_css(":root { --radius-scale: 0.7; }"));
+      set_quick_css(":root { --radius-scale: 2.0; }").expect("persist quick css");
+      assert_eq!(radius_scale(), Some(0.7));
+      assert_eq!(
+         load_config(&tmp.join("themes.json")).quick_css,
+         ":root { --radius-scale: 2.0; }"
+      );
+
+      reset_for_test();
+      let _ = std::fs::remove_dir_all(&tmp);
+   }
 }

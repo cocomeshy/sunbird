@@ -655,12 +655,71 @@ impl Platform for Desktop {
             });
             Some(remote::ok_json(&mana_theme::debug_tokens(names.as_deref())))
          },
+         ("POST", "/themes/reload") => {
+            #[derive(serde::Serialize)]
+            struct ReloadReply {
+               reloaded: bool,
+               active:   bool,
+            }
+            if mana_theme::is_supported() {
+               match mana_theme::reload_active() {
+                  Ok(reloaded) => {
+                     Some(remote::ok_json(&ReloadReply {
+                        reloaded: reloaded.is_some(),
+                        active:   reloaded.unwrap_or(false),
+                     }))
+                  },
+                  Err(err) => Some(remote::err("400 Bad Request", &err)),
+               }
+            } else {
+               Some(remote::err(
+                  "503 Service Unavailable",
+                  "themes are not supported on this build",
+               ))
+            }
+         },
+         ("GET", "/themes/quick-css") => {
+            #[derive(serde::Serialize)]
+            struct QuickCssReply {
+               quick_css: String,
+            }
+            Some(remote::ok_json(&QuickCssReply {
+               quick_css: mana_theme::quick_css(),
+            }))
+         },
+         ("POST", "/themes/quick-css") => {
+            #[derive(serde::Deserialize)]
+            struct QuickCssBody {
+               css: String,
+            }
+            #[derive(serde::Serialize)]
+            struct QuickCssSaved {
+               saved: bool,
+            }
+            if !mana_theme::is_supported() {
+               return Some(remote::err(
+                  "503 Service Unavailable",
+                  "themes are not supported on this build",
+               ));
+            }
+            let Ok(parsed) = serde_json::from_slice::<QuickCssBody>(&request.body) else {
+               return Some(remote::err(
+                  "400 Bad Request",
+                  "expected JSON body {\"css\": \"...\"}",
+               ));
+            };
+            match mana_theme::set_quick_css(&parsed.css) {
+               Ok(()) => Some(remote::ok_json(&QuickCssSaved { saved: true })),
+               Err(err) => Some(remote::err("409 Conflict", &err)),
+            }
+         },
          _ => None,
       }
    }
 
    fn routes(&self) -> &'static str {
-      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens"
+      ", GET /ui, POST /ui/devtools, POST /ui/{choose,sheet}, GET /health, GET /themes/tokens, \
+       POST /themes/reload, GET /themes/quick-css, POST /themes/quick-css"
    }
 }
 

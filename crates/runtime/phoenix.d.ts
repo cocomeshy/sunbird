@@ -1096,6 +1096,10 @@ declare namespace Phoenix {
     apply(id: string): void;
     /// Applies stylesheet text, such as a bundled preset. Returns whether it themes anything.
     setCss(css: string): boolean;
+    /// Reloads the active theme file applied by this plugin from disk.
+    reload(): boolean;
+    /// Returns the persisted quick-CSS overlay from `themes.json`.
+    quickCss(): string;
     clear(): void;
     openThemesDir(): void;
   }

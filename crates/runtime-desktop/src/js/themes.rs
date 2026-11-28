@@ -114,6 +114,11 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
          gpui_theme::clear();
       })?,
    )?;
+   attach_reload(ctx, &themes, plugin)?;
+   themes.set(
+      "quickCss",
+      Function::new(ctx.clone(), crate::mana_theme::quick_css)?,
+   )?;
    themes.set(
       "openThemesDir",
       Function::new(ctx.clone(), || {
@@ -122,4 +127,32 @@ pub fn object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>
       })?,
    )?;
    Ok(themes)
+}
+
+fn attach_reload<'js>(
+   ctx: &Ctx<'js>,
+   themes: &Object<'js>,
+   plugin: &str,
+) -> rquickjs::Result<()> {
+   let owner = plugin.to_owned();
+   themes.set(
+      "reload",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         if !crate::mana_theme::is_supported() {
+            return Ok(false);
+         }
+         let owns_file = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(active_owner, file)| active_owner == &owner && file.is_some());
+         if !owns_file {
+            return Ok(false);
+         }
+         crate::mana_theme::reload_active()
+            .map(|reloaded| reloaded.unwrap_or(false))
+            .map_err(|err| Exception::throw_message(&ctx, &err))
+      })?,
+   )?;
+   Ok(())
 }
