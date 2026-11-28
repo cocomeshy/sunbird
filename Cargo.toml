@@ -12,6 +12,7 @@ members  = [
   "crates/sigscan",
   "crates/stand-in",
   "crates/stand-in-demo",
+  "crates/themes",
   "crates/ui-desktop",
   "crates/ui-mobile",
   "crates/wire",
@@ -45,6 +46,7 @@ phoenix-runtime         = { path = "crates/runtime" }
 phoenix-runtime-desktop = { path = "crates/runtime-desktop" }
 phoenix-runtime-mobile  = { path = "crates/runtime-mobile" }
 phoenix-sigs            = { path = "crates/sigs" }
+phoenix-themes          = { path = "crates/themes" }
 phoenix-ui-desktop      = { path = "crates/ui-desktop" }
 phoenix-ui-mobile       = { path = "crates/ui-mobile" }
 phoenix-wire            = { path = "crates/wire" }

@@ -346,6 +346,28 @@ fn x86(image: &Image<'_>, code: &[u8], ip: usize, limit: usize) -> Vec<Step> {
                _ => Op::Other,
             }
          },
+         (_, Mnemonic::Add)
+            if instruction.op0_kind() == OpKind::Register
+               && matches!(
+                  instruction.op1_kind(),
+                  OpKind::Immediate8
+                     | OpKind::Immediate8to64
+                     | OpKind::Immediate32
+                     | OpKind::Immediate8to32
+                     | OpKind::Immediate32to64
+                     | OpKind::Immediate16
+               ) =>
+         {
+            gpr(instruction.op0_register())
+               .filter(|&reg| reg != 4)
+               .map_or(Op::Other, |reg| {
+                  Op::Offset {
+                     reg,
+                     base: reg,
+                     offset: instruction.immediate(1).cast_signed() as isize,
+                  }
+               })
+         },
          (_, Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd) => {
             let base = gpr(instruction.memory_base());
             let offset = instruction.memory_displacement64().cast_signed() as isize;

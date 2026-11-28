@@ -16,6 +16,8 @@ pub mod staff;
 
 #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod gpui;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod mana_theme;
 
 use crate::{
    Found,
@@ -168,6 +170,27 @@ pub const LOCATORS: &[Locator] = &[
          settings::settings_section(ix)
             .and_then(|section| settings::settings_page_changed(ix, section.page_offset))
             .and_then(|func| hookable(ix, func))
+      },
+   },
+   #[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+   Locator {
+      name:     "mana theme",
+      families: DESKTOP,
+      run:      |ix| {
+         mana_theme::mana_theme(ix).and_then(|found| {
+            Ok(format!(
+               "set_global {}, pool {:#x}, sync {:#x}, drop {:#x}, size {:#x}, get_mut {:#x}, \
+                colors {:#x}, {:x?}",
+               hookable(ix, found.set_global)?,
+               found.sync_pool,
+               found.sync_theme,
+               found.drop_in_place,
+               found.size,
+               found.get_mut,
+               found.colors_size,
+               found.layout,
+            ))
+         })
       },
    },
    #[cfg(any(target_arch = "x86_64", target_os = "macos"))]

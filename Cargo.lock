@@ -715,6 +715,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-themes"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "phoenix-ui-desktop"
 version = "0.3.1"
 dependencies = [
